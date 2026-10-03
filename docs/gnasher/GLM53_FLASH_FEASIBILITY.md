@@ -344,3 +344,48 @@ times that. They are the single largest compute item and the only one worth
 kernel work. `xctrace` is not available here (Command Line Tools only), so
 there is no GPU timeline; the next check is a DRAM-bound microbenchmark of
 MUL_MAT_ID against a plain MUL_MAT of equal bytes.
+
+## Why the expert matmuls run below bandwidth in situ (measured 2026-10-02)
+
+Microbenchmarks cleared the kernel: at DRAM-bound sizes MUL_MAT_ID equals a
+plain MUL_MAT of the same bytes and every quant type lands at 540-595 GB/s,
+including experts scattered over a 1.4 GB tensor. Residency sets on or off
+make no difference. Yet in the streamed run the three expert matmuls reach
+~175 GB/s, and the same slowdown appears on the streamed Qwen model whose
+experts are tiny, with the same fingerprint in both: the first matmul after
+the remap is the slowest, the second faster, the third fastest.
+
+That is a GPU clock ramp. Every layer the GPU idles for a fraction of a
+millisecond while the CPU remaps (and the host-op experiment showed an
+in-command-buffer event wait idles it just the same), it drops frequency, and
+the next kernels run slow while it recovers.
+
+Test: `GGML_METAL_KEEP_WARM=1` starts a thread that submits 64 KB blit fills
+on its own queue so the GPU never idles (`GGML_METAL_KEEP_WARM_US=N` pauses
+between fills). GLM-5.3-Flash, 200 slots, packed, uncached, alternating runs:
+
+| mode | ms/token |
+| --- | ---: |
+| plain | 82.5, 81.0, 80.2 |
+| keep-warm continuous | 74.6, 78.3, 71.6 |
+| keep-warm, 50 us pause | 76.7 |
+| keep-warm, 200 us pause | 77.6, 78.7 |
+
+A 4-8% gain with the I/O stall unchanged, so it is all compute. Kept opt-in
+because it holds the GPU busy continuously; a version that pulses only during
+the remap gaps would keep most of the gain at a fraction of the power. A
+heavier concurrent load (test-backend-ops SCALE loop) made things slower, so
+the benefit is specifically from avoiding idle, not from contention.
+
+## State of play
+
+GLM-5.3-Flash IQ4_XS on this M5 Max: 7.5 tok/s this morning, 12.5-14 tok/s
+now (200 slots, expert pack, uncached reads, optionally keep-warm), identical
+output throughout. Remaining per-token budget at 200 slots: ~26 ms expert I/O
+stall (hit rate 89.5%, RAM-bound), ~21-27 ms expert matmuls (bandwidth plus
+clock ramp), ~25-30 ms of small kernels across ~7,000 nodes. What would move
+each: more RAM or lower-precision experts for the first; keep-warm or pulsed
+warm-up for the second; a kernel-level GPU timeline (needs Xcode's xctrace,
+not installed) to find fusion targets for the third. Speculative decoding,
+Metal host ops, I/O thread counts, quant-type kernels and residency were all
+measured and found not to help here.

@@ -70,6 +70,11 @@ On unified-memory Macs the runtime also fills cache slots by reading directly in
 Metal shared buffer rather than through a staging copy (`LLAMA_MOE_STREAM_NO_DIRECT_WRITE=1`
 disables it).
 
+Experimental switches measured on an M5 Max (see `docs/gnasher/GLM53_FLASH_FEASIBILITY.md`):
+`GGML_METAL_KEEP_WARM=1` keeps the GPU from idling between streamed layers (+4-8% decode, costs
+power); `LLAMA_MOE_STREAM_METAL_HOST_OP=1` runs the prefill remap inside the Metal command
+buffer (neutral); `GNASHER_PROFILE_OPS=1` prints a per-op time profile from `llama-completion`.
+
 ### Example: GLM-5.3-Flash on a Mac
 
 ```sh
