@@ -389,3 +389,35 @@ warm-up for the second; a kernel-level GPU timeline (needs Xcode's xctrace,
 not installed) to find fusion targets for the third. Speculative decoding,
 Metal host ops, I/O thread counts, quant-type kernels and residency were all
 measured and found not to help here.
+
+## Pulsed keep-warm (measured 2026-10-02)
+
+`GGML_METAL_KEEP_WARM=pulse`: the keep-warm thread fills only while the MoE
+streaming remap holds a pulse, plus a linger after release
+(`GGML_METAL_KEEP_WARM_LINGER_US`, default 1000). The GPU is left completely
+idle between requests, unlike continuous mode. GLM-5.3-Flash, 200 slots,
+packed, uncached, alternating runs:
+
+| mode | ms/token |
+| --- | ---: |
+| plain | 79.5, 80.0, 82.2 |
+| pulse, linger 300 us | 80.3, 80.2 (no gain) |
+| pulse, linger 600 us | 72.5 |
+| pulse, linger 1000 us (default) | 72.2, 72.5, 72.6 |
+| pulse, linger 2000 us | 75.0 |
+| continuous | 71.8, 75.7 |
+
+The remap alone is not the idle window: the scheduler drains the GPU before
+the remap and resubmits after it, so the fills must span about a millisecond
+past the remap's return. 600-1000 us is the knee; longer lingers start to
+contend. Result: ~9% on decode, 12.5 -> 13.8 tok/s, output unchanged, and no
+GPU activity when nothing is being generated.
+
+Recommended launch on this machine now adds the pulse:
+
+```sh
+GGML_METAL_KEEP_WARM=pulse LLAMA_MOE_STREAM_DYN=200 llama-server \
+    -m GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf \
+    --moe-stream-cache 200s --moe-stream-ram 0 --moe-stream-direct -c 65536 \
+    --chat-template-kwargs '{"reasoning_effort":"high"}' --port 8080
+```

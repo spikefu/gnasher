@@ -937,7 +937,7 @@ struct ggml_metal_device {
 //   GGML_METAL_KEEP_WARM=1      a thread submits 64 KB blit fills on its own queue continuously
 //   GGML_METAL_KEEP_WARM=pulse  fills only while a pulse is held (the streaming remap holds one
 //                               for its duration) plus GGML_METAL_KEEP_WARM_LINGER_US afterwards
-//                               (default 300) to cover the scheduler's resubmit
+//                               (default 1000) to cover the scheduler's drain and resubmit
 static struct {
     bool            enabled;
     bool            pulsed;
@@ -1011,7 +1011,7 @@ static void ggml_metal_keep_warm_start(ggml_metal_device_t dev) {
     g_warm.enabled  = true;
     g_warm.pulsed   = strcmp(mode, "pulse") == 0 || strcmp(mode, "2") == 0;
     g_warm.pause_us = getenv("GGML_METAL_KEEP_WARM_US") ? (useconds_t) atoi(getenv("GGML_METAL_KEEP_WARM_US")) : 0;
-    g_warm.linger_us = getenv("GGML_METAL_KEEP_WARM_LINGER_US") ? atoll(getenv("GGML_METAL_KEEP_WARM_LINGER_US")) : 300;
+    g_warm.linger_us = getenv("GGML_METAL_KEEP_WARM_LINGER_US") ? atoll(getenv("GGML_METAL_KEEP_WARM_LINGER_US")) : 1000;
     g_warm.dev = dev;
     pthread_mutex_init(&g_warm.mtx, NULL);
     pthread_cond_init(&g_warm.cv, NULL);

@@ -71,8 +71,8 @@ Metal shared buffer rather than through a staging copy (`LLAMA_MOE_STREAM_NO_DIR
 disables it).
 
 Experimental switches measured on an M5 Max (see `docs/gnasher/GLM53_FLASH_FEASIBILITY.md`):
-`GGML_METAL_KEEP_WARM=1` keeps the GPU from idling between streamed layers (+4-8% decode, costs
-power); `LLAMA_MOE_STREAM_METAL_HOST_OP=1` runs the prefill remap inside the Metal command
+`GGML_METAL_KEEP_WARM=pulse` keeps the GPU clocked through the per-layer CPU gaps of expert
+streaming (+9% decode, idle between requests; `=1` runs continuously); `LLAMA_MOE_STREAM_METAL_HOST_OP=1` runs the prefill remap inside the Metal command
 buffer (neutral); `GNASHER_PROFILE_OPS=1` prints a per-op time profile from `llama-completion`.
 
 ### Example: GLM-5.3-Flash on a Mac
