@@ -123,13 +123,39 @@ static void gnasher_prof_print() {
     for (const auto & kv : g_prof.by_key) { total += kv.second.us; }
     std::vector<std::pair<std::string, gnasher_prof::acc>> rows(g_prof.by_key.begin(), g_prof.by_key.end());
     std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second.us > b.second.us; });
-    fprintf(stderr, "\n=== gnasher op profile: %lld nodes, %.1f ms total (per-node sync included) ===\n", (long long) g_prof.n_nodes, total/1000.0);
-    fprintf(stderr, "%7s %10s %9s %9s  %s\n", "pct", "total ms", "calls", "us/call", "op tensor-family");
-    int shown = 0;
+    // the per-node synchronization floor: the cheapest frequent op is essentially all sync
+    // RESHAPE/VIEW/TRANSPOSE/PERMUTE dispatch no kernel on Metal, so their time is the pure
+    // per-node synchronization cost; fall back to the cheapest frequent op if none are present
+    double floor_us = 0, floor_n = 0;
     for (const auto & r : rows) {
-        if (shown++ >= 40) break;
-        fprintf(stderr, "%6.2f%% %10.1f %9lld %9.1f  %s\n", 100.0*r.second.us/total, r.second.us/1000.0, (long long) r.second.n, r.second.us/r.second.n, r.first.c_str());
+        const std::string op = r.first.substr(0, r.first.find(' '));
+        if (op == "RESHAPE" || op == "VIEW" || op == "TRANSPOSE" || op == "PERMUTE") {
+            floor_us += r.second.us; floor_n += (double) r.second.n;
+        }
     }
+    if (floor_n > 0) {
+        floor_us /= floor_n;
+    } else {
+        floor_us = 1e9;
+        for (const auto & r : rows) {
+            if (r.second.n >= 1000) floor_us = std::min(floor_us, r.second.us/r.second.n);
+        }
+    }
+    const int64_t n_tok = getenv("GNASHER_PROFILE_TOKENS") ? atoll(getenv("GNASHER_PROFILE_TOKENS")) : 0;
+    fprintf(stderr, "\n=== gnasher op profile: %lld nodes, %.1f ms total, sync floor %.1f us/node%s ===\n",
+            (long long) g_prof.n_nodes, total/1000.0, floor_us, n_tok ? " (ms/token = above-floor time per generated token)" : "");
+    fprintf(stderr, "%7s %10s %9s %9s %9s %9s  %s\n", "pct", "total ms", "calls", "us/call", "above", n_tok ? "ms/token" : "", "op tensor-family");
+    double above_total = 0;
+    for (const auto & r : rows) {
+        above_total += std::max(0.0, r.second.us - floor_us*r.second.n);
+    }
+    for (const auto & r : rows) {
+        const double above = std::max(0.0, r.second.us - floor_us*r.second.n);
+        if (above < 0.002*above_total && r.second.us < 0.002*total) continue;
+        fprintf(stderr, "%6.2f%% %10.1f %9lld %9.1f %9.1f %9.2f  %s\n", 100.0*r.second.us/total, r.second.us/1000.0, (long long) r.second.n,
+                r.second.us/r.second.n, above/std::max<int64_t>(1, r.second.n), n_tok ? above/1000.0/n_tok : 0.0, r.first.c_str());
+    }
+    fprintf(stderr, "above-floor total: %.1f ms%s\n", above_total/1000.0, n_tok ? (" = " + std::to_string(above_total/1000.0/n_tok) + " ms/token").c_str() : "");
 }
 
 int llama_completion(int argc, char ** argv);

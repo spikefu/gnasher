@@ -321,3 +321,26 @@ Budget per token at 200 slots on the 480-token prompt (79 ms): ~26 ms I/O
 stall inside the remap, ~21 ms expert matmuls, ~32 ms everything else
 (KDA/MLA attention, hyper-connections, router chain, shared experts, head).
 The last bucket is the one still unprofiled at kernel level.
+
+Per-op decode costs above the sync floor (480-token prompt, 128 generated,
+200 slots packed uncached; floor 157 us from the no-op rows):
+
+| op | calls/token | us above floor | ms/token |
+| --- | ---: | ---: | ---: |
+| MAP_CUSTOM1 remap (includes expert I/O wait) | 42 | 961 | 40.1 |
+| MUL_MAT_ID ffn_moe_gate | 42 | 268 | 11.4 |
+| MUL_MAT_ID ffn_moe_up | 42 | 198 | 8.4 |
+| MUL_MAT_ID ffn_moe_down | 42 | 167 | 7.1 |
+| MUL_MAT kda_out | 34 | 96 | 3.3 |
+| MUL_MAT ffn_gate / ffn_up (per-layer dense) | 45 each | 40-45 | 3.8 |
+| MUL_MAT attn_out (MLA) | 11 | 166 | 1.8 |
+| GLU swiglu (moe + dense) | 88 | 23-41 | 2.8 |
+| MUL_MAT ffn_shexp | 42 | 27 | 1.1 |
+| everything else | ~7,000 | < 3 each | below resolution |
+
+The three expert matmuls read 4.7 GB per token in ~27 ms, about 175 GB/s,
+while the cache-resident microbenchmark of the same kernel implies several
+times that. They are the single largest compute item and the only one worth
+kernel work. `xctrace` is not available here (Command Line Tools only), so
+there is no GPU timeline; the next check is a DRAM-bound microbenchmark of
+MUL_MAT_ID against a plain MUL_MAT of equal bytes.
