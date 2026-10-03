@@ -12,6 +12,7 @@
 
 #include <stdatomic.h>
 #include <pthread.h>
+#include <time.h>
 #include <sched.h>
 #include <unistd.h>
 
@@ -931,19 +932,44 @@ struct ggml_metal_device {
 };
 
 
-// GGML_METAL_KEEP_WARM=1: a thread that keeps submitting trivial blit work on its own queue so the GPU
-// never idles between the per-layer CPU gaps of MoE expert streaming. Hypothesis under test: the GPU
-// drops its clock during those ~0.5 ms gaps and the first kernels of the next layer run slow while it
-// ramps back up. Costs power; measurement aid first, feature second.
+// GPU keep-warm: the per-layer CPU gaps of MoE expert streaming let the GPU drop its clock, and
+// the next kernels run slow while it ramps back (measured: first matmul after the gap slowest).
+//   GGML_METAL_KEEP_WARM=1      a thread submits 64 KB blit fills on its own queue continuously
+//   GGML_METAL_KEEP_WARM=pulse  fills only while a pulse is held (the streaming remap holds one
+//                               for its duration) plus GGML_METAL_KEEP_WARM_LINGER_US afterwards
+//                               (default 300) to cover the scheduler's resubmit
+static struct {
+    bool            enabled;
+    bool            pulsed;
+    useconds_t      pause_us;
+    int64_t         linger_us;
+    pthread_mutex_t mtx;
+    pthread_cond_t  cv;
+    int             active;        // held pulses
+    int64_t         deadline_us;   // keep filling until this time after the last release
+    ggml_metal_device_t dev;
+} g_warm;
+
+static int64_t ggml_metal_time_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t) ts.tv_sec*1000000 + ts.tv_nsec/1000;
+}
+
 static void * ggml_metal_keep_warm_thread(void * arg) {
-    ggml_metal_device_t dev = (ggml_metal_device_t) arg;
+    (void) arg;
     pthread_setname_np("ggml-metal-keep-warm");
     @autoreleasepool {
-        id<MTLCommandQueue> queue = [dev->mtl_device newCommandQueue];
-        id<MTLBuffer> buf = [dev->mtl_device newBufferWithLength:65536 options:MTLResourceStorageModePrivate];
-        const char * e = getenv("GGML_METAL_KEEP_WARM_US");
-        const useconds_t pause_us = e ? (useconds_t) atoi(e) : 0;
+        id<MTLCommandQueue> queue = [g_warm.dev->mtl_device newCommandQueue];
+        id<MTLBuffer> buf = [g_warm.dev->mtl_device newBufferWithLength:65536 options:MTLResourceStorageModePrivate];
         while (true) {
+            if (g_warm.pulsed) {
+                pthread_mutex_lock(&g_warm.mtx);
+                while (g_warm.active == 0 && ggml_metal_time_us() >= g_warm.deadline_us) {
+                    pthread_cond_wait(&g_warm.cv, &g_warm.mtx);
+                }
+                pthread_mutex_unlock(&g_warm.mtx);
+            }
             @autoreleasepool {
                 id<MTLCommandBuffer> cb = [queue commandBuffer];
                 id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
@@ -952,21 +978,46 @@ static void * ggml_metal_keep_warm_thread(void * arg) {
                 [cb commit];
                 [cb waitUntilCompleted];
             }
-            if (pause_us > 0) {
-                usleep(pause_us);
+            if (g_warm.pause_us > 0) {
+                usleep(g_warm.pause_us);
             }
         }
     }
     return NULL;
 }
 
-static void ggml_metal_keep_warm_start(ggml_metal_device_t dev) {
-    if (getenv("GGML_METAL_KEEP_WARM") == NULL) {
+void ggml_metal_device_keep_warm_pulse(bool on) {
+    if (!g_warm.enabled || !g_warm.pulsed) {
         return;
     }
+    pthread_mutex_lock(&g_warm.mtx);
+    if (on) {
+        g_warm.active++;
+        pthread_cond_signal(&g_warm.cv);
+    } else {
+        if (g_warm.active > 0) {
+            g_warm.active--;
+        }
+        g_warm.deadline_us = ggml_metal_time_us() + g_warm.linger_us;
+    }
+    pthread_mutex_unlock(&g_warm.mtx);
+}
+
+static void ggml_metal_keep_warm_start(ggml_metal_device_t dev) {
+    const char * mode = getenv("GGML_METAL_KEEP_WARM");
+    if (mode == NULL || g_warm.enabled) {
+        return;
+    }
+    g_warm.enabled  = true;
+    g_warm.pulsed   = strcmp(mode, "pulse") == 0 || strcmp(mode, "2") == 0;
+    g_warm.pause_us = getenv("GGML_METAL_KEEP_WARM_US") ? (useconds_t) atoi(getenv("GGML_METAL_KEEP_WARM_US")) : 0;
+    g_warm.linger_us = getenv("GGML_METAL_KEEP_WARM_LINGER_US") ? atoll(getenv("GGML_METAL_KEEP_WARM_LINGER_US")) : 300;
+    g_warm.dev = dev;
+    pthread_mutex_init(&g_warm.mtx, NULL);
+    pthread_cond_init(&g_warm.cv, NULL);
     pthread_t th;
-    pthread_create(&th, NULL, ggml_metal_keep_warm_thread, dev);
-    GGML_LOG_INFO("%s: GPU keep-warm thread started\n", __func__);
+    pthread_create(&th, NULL, ggml_metal_keep_warm_thread, NULL);
+    GGML_LOG_INFO("%s: GPU keep-warm thread started (%s%s)\n", __func__, g_warm.pulsed ? "pulsed, linger " : "continuous", g_warm.pulsed ? [[NSString stringWithFormat:@"%lld us", (long long) g_warm.linger_us] UTF8String] : "");
 }
 
 // registry of callback functions allowed to run as host ops inside Metal command buffers

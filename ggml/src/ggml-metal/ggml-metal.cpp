@@ -946,12 +946,19 @@ void ggml_backend_metal_register_host_op(const void * fun) {
     ggml_metal_device_register_host_op(fun);
 }
 
+void ggml_backend_metal_keep_warm_pulse(bool on) {
+    ggml_metal_device_keep_warm_pulse(on);
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
     }
     if (strcmp(name, "ggml_backend_metal_register_host_op") == 0) {
         return (void *)ggml_backend_metal_register_host_op;
+    }
+    if (strcmp(name, "ggml_backend_metal_keep_warm_pulse") == 0) {
+        return (void *)ggml_backend_metal_keep_warm_pulse;
     }
     if (strcmp(name, "ggml_backend_metal_tuning_set_fa_vec_override") == 0) {
         return (void *)ggml_backend_metal_tuning_set_fa_vec_override;

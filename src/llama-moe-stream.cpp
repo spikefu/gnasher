@@ -1029,11 +1029,34 @@ void llama_moe_stream::print_stats() const {
 // then rewrite each id to its cache slot. this only relabels ids, so the same experts are computed
 // in the same order; the result matches a non-streamed run (bit-exact when both paths use the same
 // kernels, as on CUDA; a CPU build that repacks the non-streamed weights can differ in the last bits).
+
+// GPU keep-warm pulse around the CPU-side remap (Metal, GGML_METAL_KEEP_WARM=pulse); resolved once
+static void (*llama_moe_stream_warm_fn)(bool) = nullptr;
+static void llama_moe_stream_warm_resolve() {
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    done = true;
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("MTL");
+    if (reg == nullptr) {
+        reg = ggml_backend_reg_by_name("Metal");
+    }
+    if (reg != nullptr) {
+        llama_moe_stream_warm_fn = (void (*)(bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_keep_warm_pulse");
+    }
+}
+struct llama_moe_stream_warm_guard {
+    llama_moe_stream_warm_guard()  { llama_moe_stream_warm_resolve(); if (llama_moe_stream_warm_fn) { llama_moe_stream_warm_fn(true);  } }
+    ~llama_moe_stream_warm_guard() { if (llama_moe_stream_warm_fn) { llama_moe_stream_warm_fn(false); } }
+};
+
 void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
     GGML_UNUSED(nth);
     if (ith != 0) {
         return;
     }
+    llama_moe_stream_warm_guard warm_guard;
 
     auto * sl  = (llama_moe_stream_layer *) userdata;
     auto * mgr = sl->mgr;
@@ -1375,6 +1398,7 @@ void llama_moe_stream::emit_wave_slots(llama_moe_stream_layer & sl, const int32_
 // the next wave), then writes the slot ids the GEMM indexes - see plan_waves_locked / stage_wave_locked
 // / emit_wave_slots. The router's expert choice is untouched, so the output matches a non-streamed run.
 void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    llama_moe_stream_warm_guard warm_guard;
     GGML_UNUSED(nth);
     if (ith != 0) {
         return;

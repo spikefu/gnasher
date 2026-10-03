@@ -335,6 +335,9 @@ ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev);
 // host-callback ops (GGML_OP_MAP_CUSTOM1 / GGML_OP_CUSTOM whose function was registered): run on the
 // CPU in the middle of a command buffer via shared events, instead of splitting the graph
 void ggml_metal_device_register_host_op(const void * fun);
+
+// GPU keep-warm pulse (GGML_METAL_KEEP_WARM=pulse): hold while the CPU is about to leave the GPU idle
+void ggml_metal_device_keep_warm_pulse(bool on);
 bool ggml_metal_device_host_op_supported(ggml_metal_device_t dev, const struct ggml_tensor * op);
 void ggml_metal_device_host_op_encode(ggml_metal_device_t dev, ggml_metal_cmd_buf_t cmd_buf, struct ggml_tensor * node);
 void ggml_metal_device_event_free(ggml_metal_device_t dev, ggml_metal_event_t ev);
