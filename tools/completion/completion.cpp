@@ -81,6 +81,57 @@ static void sigint_handler(int signo) {
 #endif
 
 // satisfies -Wmissing-declarations
+
+// gnasher: per-op profile via the scheduler eval callback (GNASHER_PROFILE_OPS=1). The scheduler
+// synchronizes after every observed node, so absolute times include a sync per node and concurrency
+// is lost; the relative cost per op/tensor family is what this is for.
+#include <map>
+#include <algorithm>
+#include <cctype>
+struct gnasher_prof {
+    struct acc { double us = 0; int64_t n = 0; };
+    std::map<std::string, acc> by_key;
+    int64_t t_last = 0;
+    int64_t n_nodes = 0;
+};
+static gnasher_prof g_prof;
+static std::string gnasher_prof_key(const ggml_tensor * t) {
+    std::string name = t->name;
+    size_t dash = name.rfind('-');
+    if (dash != std::string::npos && dash + 1 < name.size() && std::all_of(name.begin() + dash + 1, name.end(), [](unsigned char c){ return std::isdigit(c) != 0; })) {
+        name.erase(dash);
+    }
+    return std::string(ggml_op_name(t->op)) + " " + name;
+}
+static bool gnasher_prof_cb(ggml_tensor * t, bool ask, void * ud) {
+    (void) ud;
+    if (ask) {
+        return true;
+    }
+    const int64_t now = ggml_time_us();
+    if (g_prof.t_last != 0) {
+        auto & a = g_prof.by_key[gnasher_prof_key(t)];
+        a.us += (double) (now - g_prof.t_last);
+        a.n  += 1;
+    }
+    g_prof.t_last = now;
+    g_prof.n_nodes++;
+    return true;
+}
+static void gnasher_prof_print() {
+    double total = 0;
+    for (const auto & kv : g_prof.by_key) { total += kv.second.us; }
+    std::vector<std::pair<std::string, gnasher_prof::acc>> rows(g_prof.by_key.begin(), g_prof.by_key.end());
+    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second.us > b.second.us; });
+    fprintf(stderr, "\n=== gnasher op profile: %lld nodes, %.1f ms total (per-node sync included) ===\n", (long long) g_prof.n_nodes, total/1000.0);
+    fprintf(stderr, "%7s %10s %9s %9s  %s\n", "pct", "total ms", "calls", "us/call", "op tensor-family");
+    int shown = 0;
+    for (const auto & r : rows) {
+        if (shown++ >= 40) break;
+        fprintf(stderr, "%6.2f%% %10.1f %9lld %9.1f  %s\n", 100.0*r.second.us/total, r.second.us/1000.0, (long long) r.second.n, r.second.us/r.second.n, r.first.c_str());
+    }
+}
+
 int llama_completion(int argc, char ** argv);
 
 int llama_completion(int argc, char ** argv) {
@@ -140,6 +191,11 @@ int llama_completion(int argc, char ** argv) {
     // load the model and apply lora adapter, if any
     LOG_INF("%s: load the model and apply lora adapter, if any\n", __func__);
 
+    if (getenv("GNASHER_PROFILE_OPS") != nullptr) {
+        params.cb_eval = gnasher_prof_cb;
+        params.cb_eval_user_data = nullptr;
+        atexit(gnasher_prof_print);
+    }
     auto llama_init = common_init_from_params(params);
 
     ctx   = llama_init->context();
