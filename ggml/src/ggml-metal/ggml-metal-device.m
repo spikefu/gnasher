@@ -930,6 +930,45 @@ struct ggml_metal_device {
     atomic_uint_fast64_t     host_v_cpu;
 };
 
+
+// GGML_METAL_KEEP_WARM=1: a thread that keeps submitting trivial blit work on its own queue so the GPU
+// never idles between the per-layer CPU gaps of MoE expert streaming. Hypothesis under test: the GPU
+// drops its clock during those ~0.5 ms gaps and the first kernels of the next layer run slow while it
+// ramps back up. Costs power; measurement aid first, feature second.
+static void * ggml_metal_keep_warm_thread(void * arg) {
+    ggml_metal_device_t dev = (ggml_metal_device_t) arg;
+    pthread_setname_np("ggml-metal-keep-warm");
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = [dev->mtl_device newCommandQueue];
+        id<MTLBuffer> buf = [dev->mtl_device newBufferWithLength:65536 options:MTLResourceStorageModePrivate];
+        const char * e = getenv("GGML_METAL_KEEP_WARM_US");
+        const useconds_t pause_us = e ? (useconds_t) atoi(e) : 0;
+        while (true) {
+            @autoreleasepool {
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+                [blit fillBuffer:buf range:NSMakeRange(0, 65536) value:0];
+                [blit endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+            }
+            if (pause_us > 0) {
+                usleep(pause_us);
+            }
+        }
+    }
+    return NULL;
+}
+
+static void ggml_metal_keep_warm_start(ggml_metal_device_t dev) {
+    if (getenv("GGML_METAL_KEEP_WARM") == NULL) {
+        return;
+    }
+    pthread_t th;
+    pthread_create(&th, NULL, ggml_metal_keep_warm_thread, dev);
+    GGML_LOG_INFO("%s: GPU keep-warm thread started\n", __func__);
+}
+
 // registry of callback functions allowed to run as host ops inside Metal command buffers
 #define GGML_METAL_HOST_OPS_MAX 32
 static const void * g_metal_host_ops[GGML_METAL_HOST_OPS_MAX];
@@ -1491,6 +1530,7 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 }
 
                 // print MTL GPU family:
+                ggml_metal_keep_warm_start(dev);
                 GGML_LOG_INFO("%s: GPU name:   %s (%s)\n", __func__, dev->props.name, dev->props.desc);
 
                 // determine max supported GPU family
