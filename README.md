@@ -52,6 +52,24 @@ as usual, so that is the memory floor.
 The dynamic pool must hold at least `3 * n_expert_used` slots (24 for an 8-expert
 model) for chunked prefill, so use at least that many slots.
 
+### Expert pack: one read per expert
+
+In a GGUF the gate, up and down tensors of a layer are stored separately, so a cache miss
+is three reads at three file offsets. `scripts/moe_expert_pack.py <first-shard.gguf>` writes
+`<first-shard.gguf>.epack`, one page-aligned blob per (layer, expert) with all of its slabs
+together; the runtime picks it up automatically and loads a miss with a single `preadv`
+straight into the cache slot (`LLAMA_MOE_STREAM_PACK=<path>` overrides the location). The
+pack is a second copy of the expert weights on disk, built in a few minutes.
+
+Measured on GLM-5.3-Flash IQ4_XS, 200 slots, M5 Max: 9.9 -> 11.2 tok/s buffered and
+10.1 -> 12.5 tok/s with `--moe-stream-direct`. On a smaller cache where decode is fully
+SSD-bound the gain is larger (Qwen3.5-35B-A3B Q8, 24 slots, uncached: 6.6 -> 10.4 tok/s).
+Output is identical with and without the pack.
+
+On unified-memory Macs the runtime also fills cache slots by reading directly into the
+Metal shared buffer rather than through a staging copy (`LLAMA_MOE_STREAM_NO_DIRECT_WRITE=1`
+disables it).
+
 ### Example: GLM-5.3-Flash on a Mac
 
 ```sh
@@ -70,6 +88,7 @@ generated tokens, `temp 0`, Metal, page cache bypassed except where noted:
 | 48 | 22.8 GB | 34.8 GB | 62% | 35.2 tok/s | 3.7 tok/s | 48 GB Mac |
 | 96 | 45.7 GB | 58.8 GB | 76% | 44.4 tok/s | 4.9 tok/s | 64 GB Mac |
 | 160 | 76.1 GB | 90.1 GB | 85% | 45.2 tok/s | 7.5 tok/s | 128 GB Mac |
+| 200 | 97.5 GB | ~107 GB | 89.5% | 46 tok/s | 9.65 tok/s, 12.5 with the expert pack and `--moe-stream-direct` | 128 GB Mac, ceiling |
 
 The resident part was 9 GB (core weights) plus about 0.5 GB of KV and compute buffers at
 8K context. All five runs produced identical text. Decode is bound by SSD bandwidth
