@@ -421,3 +421,26 @@ GGML_METAL_KEEP_WARM=pulse LLAMA_MOE_STREAM_DYN=200 llama-server \
     --moe-stream-cache 200s --moe-stream-ram 0 --moe-stream-direct -c 65536 \
     --chat-template-kwargs '{"reasoning_effort":"high"}' --port 8080
 ```
+
+## GPU timeline (Metal System Trace via xctrace, 2026-10-02)
+
+With Xcode installed, `scripts/gnasher-bench/gpu-trace.sh` records a Metal
+System Trace of a short decode and `xctrace_parse.py` reads the exported
+tables. GLM-5.3-Flash, 200 slots, packed, uncached, pulsed keep-warm:
+
+- During decode the GPU is **Active 20-25% of the time** (metal-gpu-state-intervals:
+  ~200-260 ms active per second). The llama process's "GPU Execution"
+  intervals total ~17 ms per generated token.
+- Between consecutive llama GPU intervals the median gap is 235 us, p90 317 us,
+  and these 100-700 us gaps account for essentially all of the idle time:
+  roughly 1.4 ms of CPU-side time per streamed layer against ~0.4 ms of GPU work.
+- Of the per-token budget (~75 ms here) that puts GPU compute at ~17 ms, the
+  measured in-remap I/O stall at ~26 ms, and ~30 ms of other CPU-side work
+  per token: scheduler split synchronization, input copies, Metal command
+  encoding (serialized with execution because every split waits for the
+  previous one), and remap bookkeeping.
+
+This supersedes the eval-callback profile, whose per-node synchronization
+attributed CPU-side waiting to GPU ops. The expert matmuls are not slow; the
+GPU is mostly waiting. The next measurement is a timer inside the scheduler's
+split loop (`GGML_SCHED_PROFILE=1`) to apportion the ~30 ms.
