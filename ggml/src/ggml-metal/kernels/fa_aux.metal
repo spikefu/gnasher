@@ -345,7 +345,6 @@ kernel void kernel_lightning_indexer(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     constexpr short DK    = OP_LIGHTNING_INDEXER_DK;
-    constexpr short NH    = OP_LIGHTNING_INDEXER_NH;
     constexpr short NHPTG = OP_LIGHTNING_INDEXER_NHPTG;
     constexpr short NKPSG = OP_LIGHTNING_INDEXER_NKPSG;
     constexpr short NSG   = OP_LIGHTNING_INDEXER_NSG;
@@ -410,7 +409,7 @@ kernel void kernel_lightning_indexer(
 
         float score = 0.0f;
 
-        FOR_UNROLL (short i_head = 0; i_head < NH; i_head += NHPTG) {
+        for (short i_head = 0; i_head < (short) args.n_head; i_head += NHPTG) { // n_head: multiple of NHPTG (64 for DeepSeek V4, 32 for GLM-5.3-Flash)
             // stage the Q tile [DK, NHPTG] and the (prescaled) head weights
             for (short i = tiitg; i < NHPTG*DK4; i += NTG) {
                 const short ih = i/DK4;

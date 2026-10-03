@@ -2035,8 +2035,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
         case GGML_OP_LIGHTNING_INDEXER:
+            if (getenv("GGML_METAL_INDEXER_CPU") != NULL) {
+                return false; // A/B switch: run the indexer on the CPU as before
+            }
+            // head count is a runtime kernel argument: any multiple of NHPTG up to NH (DeepSeek V4: 64, GLM-5.3-Flash: 32)
             if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK ||
-                op->src[0]->ne[1] != OP_LIGHTNING_INDEXER_NH) {
+                op->src[0]->ne[1] % OP_LIGHTNING_INDEXER_NHPTG != 0 ||
+                op->src[0]->ne[1] > OP_LIGHTNING_INDEXER_NH ||
+                op->src[0]->ne[1] < OP_LIGHTNING_INDEXER_NHPTG) {
                 return false;
             }
             if (!has_simdgroup_mm ||

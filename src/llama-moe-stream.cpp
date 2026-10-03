@@ -198,6 +198,51 @@ static bool llama_moe_stream_pread_slot(int fd, uint8_t * dst, size_t len, size_
     return true;
 }
 
+
+// read one contiguous file range into several destinations, split into `chunks` 4 KiB-aligned pieces
+// read concurrently (GCD on Apple, sequential elsewhere)
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#endif
+static bool llama_moe_stream_pread_chunked(int fd, const std::vector<iovec> & iov, size_t offs, int chunks) {
+    // flatten destinations into (file offset, dst, len) pieces, then cut into `chunks` aligned ranges
+    struct piece { size_t off; uint8_t * dst; size_t len; };
+    std::vector<piece> pieces;
+    size_t total = 0;
+    for (const auto & v : iov) { total += v.iov_len; }
+    const size_t a = MOE_STREAM_DIRECT_ALIGN;
+    const size_t step = ((total / chunks + a - 1) / a) * a;
+    size_t cur_off = 0; size_t vi = 0; size_t v_done = 0;
+    for (int c = 0; c < chunks && cur_off < total; c++) {
+        size_t end = std::min(total, cur_off + step);
+        if (c == chunks - 1) { end = total; }
+        size_t pos = cur_off;
+        while (pos < end) {
+            while (vi < iov.size() && v_done == iov[vi].iov_len) { vi++; v_done = 0; }
+            if (vi >= iov.size()) { break; }
+            const size_t n = std::min(end - pos, iov[vi].iov_len - v_done);
+            pieces.push_back({ offs + pos, (uint8_t *) iov[vi].iov_base + v_done, n });
+            pos += n; v_done += n;
+        }
+        cur_off = end;
+    }
+    std::atomic<int> failed{0};
+    std::atomic<int> * pfailed = &failed; // blocks capture by value; a pointer to the atomic is fine
+    const piece * ppieces = pieces.data();
+#ifdef __APPLE__
+    dispatch_apply(pieces.size(), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
+        if (!llama_moe_stream_pread_exact(fd, ppieces[i].dst, ppieces[i].len, ppieces[i].off)) {
+            pfailed->store(1);
+        }
+    });
+#else
+    for (const auto & pc : pieces) {
+        if (!llama_moe_stream_pread_exact(fd, pc.dst, pc.len, pc.off)) { pfailed->store(1); }
+    }
+#endif
+    return failed.load() == 0;
+}
+
 // scattered positional read of one contiguous file range into several destinations
 static bool llama_moe_stream_preadv_exact(int fd, std::vector<iovec> & iov, size_t offs) {
 #ifdef _WIN32
@@ -815,6 +860,15 @@ void llama_moe_stream::worker_loop() {
     std::vector<llama_moe_stream_work> batch;
     std::vector<uint8_t>               batch_ok;
 
+    // LLAMA_MOE_STREAM_CHUNKS=N (default 4 on Apple, 1 elsewhere): parallel sub-reads per packed miss
+    int chunks = 1;
+#ifdef __APPLE__
+    chunks = 4;
+#endif
+    if (const char * e = getenv("LLAMA_MOE_STREAM_CHUNKS")) {
+        chunks = std::max(1, atoi(e));
+    }
+
     std::unique_lock<std::mutex> lk(mtx);
     while (true) {
         cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty(); });
@@ -873,7 +927,15 @@ void llama_moe_stream::worker_loop() {
                         expect += wt->nb_expert;
                         iov.push_back({ (uint8_t *) wt->cache->data + (size_t) w.slot*wt->nb_expert, wt->nb_expert });
                     }
-                    if (!contiguous || !llama_moe_stream_preadv_exact(pack_fd, iov, blob_offs)) {
+                    if (!contiguous) {
+                        batch_ok[k] = 0;
+                    } else if (chunks > 1 && batch.size() < (size_t) n_io_threads) {
+                        // few misses in flight: split this blob into aligned chunks and read them in parallel,
+                        // so one expert's latency is ~1/chunks instead of one thread's sequential read
+                        if (!llama_moe_stream_pread_chunked(pack_fd, iov, blob_offs, chunks)) {
+                            batch_ok[k] = 0;
+                        }
+                    } else if (!llama_moe_stream_preadv_exact(pack_fd, iov, blob_offs)) {
                         batch_ok[k] = 0;
                     }
                 } else {

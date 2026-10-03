@@ -1,4 +1,5 @@
 #import "ggml-metal-context.h"
+#include <time.h>
 
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
@@ -254,6 +255,23 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
+        // GGML_METAL_SPIN_US=N: poll the status for up to N us before blocking. The blocking wait costs a
+        // thread wake-up per split, which MoE expert streaming pays ~50 times per token.
+        static int spin_us = -1;
+        if (spin_us < 0) {
+            const char * e = getenv("GGML_METAL_SPIN_US");
+            spin_us = e ? atoi(e) : 0;
+        }
+        if (spin_us > 0) {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            const int64_t t0 = (int64_t) ts.tv_sec*1000000 + ts.tv_nsec/1000;
+            while ([ctx->cmd_buf_last status] < MTLCommandBufferStatusCompleted) {
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                if ((int64_t) ts.tv_sec*1000000 + ts.tv_nsec/1000 - t0 > spin_us) {
+                    break;
+                }
+            }
+        }
         [ctx->cmd_buf_last waitUntilCompleted];
         ctx->cmd_buf_last = nil;
     }

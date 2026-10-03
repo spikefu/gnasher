@@ -1282,6 +1282,7 @@ typedef struct {
     int32_t  n_kv;
     int32_t  n_batch;
     int32_t  mask_ne3;
+    int32_t  n_head;
     uint64_t nb1;
     uint64_t nb3;
     uint64_t nbq1;
