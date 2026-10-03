@@ -902,8 +902,10 @@ void llama_moe_stream::worker_loop() {
                     continue;
                 }
 
-                if (wt.direct_write) {
-                    // unified memory: read straight into the slot, no staging copy
+                // unified memory: read straight into the slot, no staging copy. Under F_NOCACHE an
+                // unaligned slab costs three reads (head, aligned middle, tail), which measured slower
+                // than one aligned read through staging, so uncached unpacked reads keep the staging path
+                if (wt.direct_write && !use_direct_io) {
                     uint8_t * dst = (uint8_t *) wt.cache->data + offs_slot;
                     if (!llama_moe_stream_pread_slot(files[wt.file_idx]->file_id(), dst, wt.nb_expert, wt.offs + (size_t) w.expert*wt.nb_expert, staging, use_direct_io)) {
                         batch_ok[k] = 0;

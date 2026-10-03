@@ -30,10 +30,11 @@ def main():
     n_expert = None
     for path in shards(first):
         r = gguf.GGUFReader(path)
-        arch = r.fields['general.architecture'].contents()
-        bc = r.fields[f'{arch}.block_count'].contents()
-        nextn = r.fields.get(f'{arch}.nextn_predict_layers')
-        n_layer_total = max(n_layer_total, bc + (nextn.contents() if nextn else 0))
+        if 'general.architecture' in r.fields:  # split shards after the first carry no model metadata
+            arch = r.fields['general.architecture'].contents()
+            bc = r.fields[f'{arch}.block_count'].contents()
+            nextn = r.fields.get(f'{arch}.nextn_predict_layers')
+            n_layer_total = max(n_layer_total, bc + (nextn.contents() if nextn else 0))
         for t in r.tensors:
             m = EXPS.match(t.name)
             if not m:
@@ -49,6 +50,7 @@ def main():
             assert nb * n_exp == int(t.n_bytes)
             layers.setdefault(il, []).append((ORDER[kind], path, int(t.data_offset), nb, int(t.tensor_type), t.name))
     assert layers, "no routed expert tensors found"
+    n_layer_total = max(n_layer_total, max(layers) + 1)
     for il in layers:
         layers[il].sort()
 
