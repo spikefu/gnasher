@@ -582,6 +582,9 @@ static projector_type clip_projector_type_from_string(const std::string & str) {
             return pair.first;
         }
     }
+    if (str == "glm5next") {
+        return PROJECTOR_TYPE_GLM5V; // Unsloth's GLM-5.3-Flash mmproj naming
+    }
     return PROJECTOR_TYPE_UNKNOWN;
 }
 

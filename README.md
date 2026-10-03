@@ -70,6 +70,16 @@ On unified-memory Macs the runtime also fills cache slots by reading directly in
 Metal shared buffer rather than through a staging copy (`LLAMA_MOE_STREAM_NO_DIRECT_WRITE=1`
 disables it).
 
+### Images and video
+
+GLM-5.3-Flash is natively multimodal; the Unsloth repo ships its vision tower as
+`mmproj-F16.gguf` (1.1 GB). Put it beside the shards and add `--mmproj <path>` to the
+server command; images and video (`image_url`, `input_video`, ffmpeg in PATH) then work
+through the OpenAI-compatible API. The loader accepts Unsloth's `glm5next` projector naming
+and its missing pixel-limit keys. Budget about 4 cache slots for it. Measured: a 640x488
+image is ~370 tokens, prefilled at 36 tok/s; decode is unchanged. Video frames are encoded
+one by one (no temporal pair merge yet), so clips cost about twice the reference token count.
+
 ### Lookahead prefetch
 
 A miss can only be loaded once the layer's router has run, so without help the SSD and the

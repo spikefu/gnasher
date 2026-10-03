@@ -1779,10 +1779,22 @@ struct clip_model_loader {
                         hparams.n_merge = 2;
                         hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
-                        get_f32(KEY_SWIGLU_CLAMP, hparams.swiglu_clamp, true);
-                        get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
-                        get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
-                        hparams.set_limit_image_tokens();
+                        // Unsloth's GLM-5.3-Flash mmproj writes the clamp as clip.vision.swiglu_limit and
+                        // omits the pixel limits; fall back to the model's processor_config values
+                        // (min_image_tokens 16, max_image_tokens 8000)
+                        hparams.swiglu_clamp = 10.0f;
+                        if (gguf_find_key(ctx_gguf.get(), KEY_SWIGLU_CLAMP) >= 0) {
+                            get_f32(KEY_SWIGLU_CLAMP, hparams.swiglu_clamp, true);
+                        } else {
+                            get_f32("clip.vision.swiglu_limit", hparams.swiglu_clamp, false);
+                        }
+                        if (gguf_find_key(ctx_gguf.get(), KEY_IMAGE_MIN_PIXELS) >= 0 && gguf_find_key(ctx_gguf.get(), KEY_IMAGE_MAX_PIXELS) >= 0) {
+                            get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
+                            get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
+                            hparams.set_limit_image_tokens();
+                        } else {
+                            hparams.set_limit_image_tokens(16, 8000);
+                        }
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                     } break;
                 case PROJECTOR_TYPE_LLAMA4:
