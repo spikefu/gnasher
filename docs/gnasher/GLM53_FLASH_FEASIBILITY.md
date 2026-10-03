@@ -444,3 +444,28 @@ This supersedes the eval-callback profile, whose per-node synchronization
 attributed CPU-side waiting to GPU ops. The expert matmuls are not slow; the
 GPU is mostly waiting. The next measurement is a timer inside the scheduler's
 split loop (`GGML_SCHED_PROFILE=1`) to apportion the ~30 ms.
+
+## Scheduler split-loop profile (GGML_SCHED_PROFILE=1, 2026-10-02)
+
+Decode token at 200 slots, packed, uncached, pulsed keep-warm: 73.8 ms inside
+the scheduler's split loop, 108 splits per token (54 Metal, 54 CPU).
+
+| bucket | ms/token | notes |
+| --- | ---: | --- |
+| CPU waiting for the GPU before each CPU split | 40.1 | GPU execution is ~17 ms (trace); the other ~23 ms is launch/complete/wake latency over 54 splits, ~0.43 ms each |
+| CPU compute (the remap) | 29.2 | of which 28.5 ms is the in-remap I/O stall; the remap's own work is <1 ms |
+| Metal graph_compute (encode + submit) | 4.4 | encoding is not the problem |
+| input copies | 0.1 | |
+
+The 54 Metal splits instead of 42: the lightning indexer op of the 11 sparse
+attention layers has no Metal implementation and runs on the CPU, so each of
+those layers costs an extra GPU round trip and its own CPU compute.
+
+Levers this exposes, with the ms they address:
+1. I/O stall (28.5): a miss is one 11.3 MB read on one thread; most layers have
+   0-2 misses, so the other reader threads sit idle. Reading a single expert as
+   several parallel chunks cuts the per-miss latency roughly by the chunk count.
+2. Round-trip latency (~23): fewer splits (move the indexer to Metal: -11 per
+   token) and a cheaper wait (spin on command-buffer status briefly before
+   blocking, to avoid the thread wake-up on every split).
+3. Encode (4.4): already small.
