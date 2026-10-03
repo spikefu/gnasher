@@ -202,3 +202,49 @@ Notes:
   tok/s, so this suits agent fan-out rather than interactive chat.
 - Two-drive striping was not testable: the only external drive here is a
   USB stick reading at 183 MB/s.
+
+## Direct slot writes and the expert pack (measured 2026-10-02)
+
+Two runtime changes on the `glm5-mtp-stream` branch:
+
+- **Direct-to-slot reads.** Metal shared buffers are host memory, so a miss is
+  now `pread` straight into the cache slot instead of into a staging buffer
+  followed by a copy. Verified per buffer at open by a write/read round trip.
+  Kept off for unpacked reads under F_NOCACHE, where the 4 KiB alignment split
+  cost more than the copy it saved.
+- **Expert pack.** `scripts/moe_expert_pack.py` writes `<gguf>.epack`: one
+  page-aligned blob per (layer, expert) holding gate, up and down together.
+  A miss becomes one contiguous `preadv` instead of three reads at three file
+  offsets. GLM-5.3-Flash IQ4_XS: 147 GB, built in about 3 minutes.
+
+Same prompt, 200 slots, byte-identical output in every run:
+
+| Model / mode | Unpacked, staging | Packed, direct write | Gain |
+| --- | ---: | ---: | ---: |
+| Qwen3.5-35B-A3B Q8, 24 slots, uncached (SSD-bound) | 6.5-6.7 tok/s | 10.4 tok/s | +57% |
+| Qwen3.5-35B-A3B Q8, 24 slots, buffered (file-cache-bound) | 18-20 tok/s | 19.3 tok/s | none |
+| GLM-5.3-Flash IQ4_XS, 200 slots, buffered | 9.8-9.9 tok/s | 11.1-11.3 tok/s | +14% |
+| GLM-5.3-Flash IQ4_XS, 200 slots, uncached | 10.1 tok/s | **12.5 tok/s** | +24% |
+
+Notes:
+
+- Whether a run is SSD-bound depends on what the file cache already holds.
+  F_NOCACHE still serves cached pages, so a GGUF just read by the pack builder
+  benchmarks far faster than a cold one. The Qwen "uncached" unpacked figure
+  swung between 6.5 and 16 tok/s across sessions for this reason. GLM at 147 GB
+  of experts plus a 107 GB wired cache never fits, so its numbers are stable.
+- With the pack, uncached beats buffered on GLM: aligned whole-blob reads gain
+  nothing from the page cache and skip its copy.
+- Direct writes alone are worth 1-3%. The pack is the lever.
+
+Recommended launch on this machine (12.5 tok/s decode, 46 tok/s prefill):
+
+```sh
+LLAMA_MOE_STREAM_DYN=200 llama-server -m GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf \
+    --moe-stream-cache 200s --moe-stream-ram 0 --moe-stream-direct -c 65536 \
+    --chat-template-kwargs '{"reasoning_effort":"high"}' --port 8080
+```
+
+The pack beside the GGUF is picked up automatically; `LLAMA_MOE_STREAM_PACK`
+overrides the path. Progress today: 7.5 -> 9.65 (cache 200 slots) -> 12.5
+tok/s (pack + uncached), with the trunk output unchanged.
