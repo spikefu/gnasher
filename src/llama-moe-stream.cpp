@@ -899,6 +899,11 @@ void llama_moe_stream::worker_loop() {
 
         batch_ok.assign(batch.size(), 1);
         std::vector<iovec> iov;
+        const int64_t t_batch0 = ggml_time_us();
+        int64_t t_handoff_acc = 0;
+        for (size_t k = 0; k < batch.size(); k++) {
+            t_handoff_acc += t_batch0 - batch[k].t_push_us;
+        }
         for (size_t k = 0; k < batch.size(); k++) {
             const auto & w  = batch[k];
             const auto & sl = *w.sl;
@@ -993,8 +998,12 @@ void llama_moe_stream::worker_loop() {
                 ggml_backend_synchronize(b.second);
             }
         }
+        const int64_t t_batch1 = ggml_time_us();
 
         lk.lock();
+        stats.t_read_us    += t_batch1 - t_batch0;
+        stats.n_read       += (int64_t) batch.size();
+        stats.t_handoff_us += t_handoff_acc;
 
         for (size_t k = 0; k < batch.size(); k++) {
             const auto & w  = batch[k];
@@ -1080,6 +1089,8 @@ void llama_moe_stream::print_stats() const {
             n_touched > 0 ? 100.0*stats.n_hit/n_touched : 0.0);
     LLAMA_LOG_INFO("%s: moe stream: load stall = %.2f ms total (%.3f ms per remap call)\n",
             __func__, stats.t_stall_us/1000.0, stats.n_calls > 0 ? stats.t_stall_us/1000.0/stats.n_calls : 0.0);
+    LLAMA_LOG_INFO("%s: moe stream: worker reads = %" PRId64 ", time inside reads = %.2f ms (%.3f ms per load), remap->worker handoff = %.3f ms per load\n",
+            __func__, stats.n_read, stats.t_read_us/1000.0, stats.n_read > 0 ? stats.t_read_us/1000.0/stats.n_read : 0.0, stats.n_read > 0 ? stats.t_handoff_us/1000.0/stats.n_read : 0.0);
     if (stats.n_wave_calls > 0) {
         LLAMA_LOG_INFO("%s: moe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms\n",
                 __func__, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0);
@@ -1183,7 +1194,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         if (it != sl->expert_slot.end()) {
             const int32_t s = it->second;
             if (sl->slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
-                mgr->q_demand.push_back({ sl, e, s, sl->slot_gen[s] });
+                mgr->q_demand.push_back({ sl, e, s, sl->slot_gen[s], ggml_time_us() });
                 mgr->cv_work.notify_one();
                 waited = true;
             }
@@ -1203,7 +1214,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
                 mgr->stats.n_miss_cold++;
             }
             mgr->reserve_slot_locked(*sl, e, v);
-            mgr->q_demand.push_back({ sl, e, v, sl->slot_gen[v] });
+            mgr->q_demand.push_back({ sl, e, v, sl->slot_gen[v], ggml_time_us() });
             mgr->cv_work.notify_one();
             mgr->stats.n_miss++;
             waited = true;
@@ -1332,7 +1343,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                 // already in the cache (resident, or still loading from the previous wave's preload)
                 const int32_t s = it->second;
                 if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
-                    q_demand.push_back({ &sl, e, s, sl.slot_gen[s] }); // promote to demand, wait for it
+                    q_demand.push_back({ &sl, e, s, sl.slot_gen[s], ggml_time_us() }); // promote to demand, wait for it
                     cv_work.notify_one();
                     waited = true;
                 } else {
@@ -1354,7 +1365,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                     stats.n_miss_cold++;
                 }
                 reserve_slot_locked(sl, e, v);
-                q_demand.push_back({ &sl, e, v, sl.slot_gen[v] });
+                q_demand.push_back({ &sl, e, v, sl.slot_gen[v], ggml_time_us() });
                 cv_work.notify_one();
                 stats.n_miss++;
                 waited = true;
@@ -1381,7 +1392,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
             }
             reserve_slot_locked(sl, e, v);
             sl.keep[v] = 1;
-            q_demand.push_back({ &sl, e, v, sl.slot_gen[v] });
+            q_demand.push_back({ &sl, e, v, sl.slot_gen[v], ggml_time_us() });
             cv_work.notify_one();
             stats.n_preload_issued++;
         }

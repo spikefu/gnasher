@@ -128,6 +128,7 @@ struct llama_moe_stream_work {
     int32_t  expert = -1;
     int32_t  slot   = -1;
     uint64_t gen    = 0; // stale unless it matches slot_gen[slot]
+    int64_t  t_push_us = 0; // when the remap queued it
 };
 
 struct llama_moe_stream {
@@ -209,6 +210,9 @@ struct llama_moe_stream {
         int64_t n_miss      = 0; // demand loads issued
         int64_t n_miss_cold = 0; // first-ever touch of an expert
         int64_t t_stall_us  = 0; // wait time in miss handling
+        int64_t t_read_us   = 0; // worker time spent inside the file reads (pure I/O)
+        int64_t n_read      = 0; // expert loads performed by workers
+        int64_t t_handoff_us = 0; // remap push -> worker starts the read
 
         int64_t n_wave_calls     = 0; // wave-ids invocations (>= n_calls under multi-pass prefill)
         int64_t n_waves_run      = 0; // non-empty waves
