@@ -285,3 +285,39 @@ cost; the CPU has to learn the routing before the expert matmul, and any
 GPU<->CPU handoff on Apple Silicon costs a few hundred microseconds per layer.
 The only way around it is to not need the CPU per layer, which means
 GPU-resident routing tables with misses handled some other way.
+
+## Where GLM-5.3-Flash decode time goes (measured 2026-10-02)
+
+Tools added: `GNASHER_PROFILE_OPS=1` in `llama-completion` (per-op time via the
+scheduler eval callback; every node is synchronized, so a ~155 us floor is
+subtracted) and `GNASHER_PERF_SHAPES=1` for `test-backend-ops perf`
+(expert matmul at GLM shapes, 288 experts, 8 used).
+
+Expert matmul kernel speed by quant type, Metal, n=1 (cache-resident microbenchmark,
+so absolute numbers are optimistic; relative order is what matters):
+
+| type | gate/up (k=4096, m=2048) | down (k=2048, m=4096) | bits/weight |
+| --- | ---: | ---: | ---: |
+| q4_0 | 41.7 us | 40.5 us | 4.5 |
+| iq4_xs (current) | 57.8 us | 51.0 us | 4.25 |
+| q4_K | 43.9 us | 75.0 us | 4.5 |
+| q3_K | 56.4 us | 75.8 us | 3.4 |
+| iq3_xxs | 71.6 us | 73.7 us | 3.06 |
+| q6_K | 81.1 us | 104.3 us | 6.6 |
+| q5_K | 98.4 us | 72.5 us | 5.5 |
+| q8_0 | 120.7 us | 119.1 us | 8.5 |
+
+The expert matmuls are bandwidth-bound: q8_0 at twice the bytes takes about
+twice as long, and q4_0's 25% kernel advantage over iq4_xs comes with 6% more
+bytes, so requantizing the experts is not a lever. In the real run the three
+expert matmuls cost ~21 ms per token for 4.7 GB of weights, ~224 GB/s.
+
+Decode sensitivity to Metal graph features (200 slots, packed, uncached, short
+prompt so the cache starts cold): default 110-113 ms/token, fusion disabled
+113, concurrency disabled 112. Neither matters, so the ~7,700 graph nodes per
+token are not a measurable encode cost either.
+
+Budget per token at 200 slots on the 480-token prompt (79 ms): ~26 ms I/O
+stall inside the remap, ~21 ms expert matmuls, ~32 ms everything else
+(KDA/MLA attention, hyper-connections, router chain, shared experts, head).
+The last bucket is the one still unprofiled at kernel level.
