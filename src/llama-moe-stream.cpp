@@ -18,6 +18,8 @@
 #include <malloc.h>
 #else
 #include <fcntl.h>
+#include <sys/uio.h>
+#include <unistd.h>
 #include <unistd.h>
 #endif
 
@@ -145,6 +147,90 @@ bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor
     return n > 0 && n == weights.size();
 }
 
+
+// exact positional read into an arbitrary destination (no alignment games: used for F_NOCACHE and
+// buffered reads that land directly in a host-visible cache slot)
+static bool llama_moe_stream_pread_exact(int fd, uint8_t * dst, size_t len, size_t offs) {
+    while (len > 0) {
+        ssize_t r = pread(fd, dst, len, offs);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (r == 0) {
+            return false;
+        }
+        dst  += r;
+        len  -= (size_t) r;
+        offs += (size_t) r;
+    }
+    return true;
+}
+
+
+// direct read into a cache slot under F_NOCACHE: the uncached path wants 4 KiB-aligned offsets and
+// lengths, so the aligned middle goes straight to the slot and the unaligned head and tail (< 4 KiB
+// each) bounce through the staging buffer
+static bool llama_moe_stream_pread_slot(int fd, uint8_t * dst, size_t len, size_t offs, uint8_t * staging, bool direct) {
+    if (!direct) {
+        return llama_moe_stream_pread_exact(fd, dst, len, offs);
+    }
+    const size_t a    = MOE_STREAM_DIRECT_ALIGN;
+    const size_t head = (a - (offs % a)) % a;          // bytes to the first aligned offset
+    if (head >= len) {
+        return llama_moe_stream_pread_exact(fd, dst, len, offs);
+    }
+    const size_t mid  = ((len - head) / a) * a;         // aligned middle
+    const size_t tail = len - head - mid;
+    if (head > 0) {
+        if (!llama_moe_stream_pread_exact(fd, staging, head, offs)) { return false; }
+        memcpy(dst, staging, head);
+    }
+    if (mid > 0 && !llama_moe_stream_pread_exact(fd, dst + head, mid, offs + head)) {
+        return false;
+    }
+    if (tail > 0) {
+        if (!llama_moe_stream_pread_exact(fd, staging, tail, offs + head + mid)) { return false; }
+        memcpy(dst + head + mid, staging, tail);
+    }
+    return true;
+}
+
+// scattered positional read of one contiguous file range into several destinations
+static bool llama_moe_stream_preadv_exact(int fd, std::vector<iovec> & iov, size_t offs) {
+#ifdef _WIN32
+    GGML_UNUSED(fd); GGML_UNUSED(iov); GGML_UNUSED(offs);
+    return false;
+#else
+    size_t idx = 0;
+    while (idx < iov.size()) {
+        ssize_t r = preadv(fd, iov.data() + idx, (int) (iov.size() - idx), offs);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (r == 0) {
+            return false;
+        }
+        offs += (size_t) r;
+        size_t n = (size_t) r;
+        while (idx < iov.size() && n >= iov[idx].iov_len) {
+            n -= iov[idx].iov_len;
+            idx++;
+        }
+        if (idx < iov.size() && n > 0) {
+            iov[idx].iov_base = (uint8_t *) iov[idx].iov_base + n;
+            iov[idx].iov_len -= n;
+        }
+    }
+    return true;
+#endif
+}
+
 // sizes the per-layer table and clamps the I/O thread count; workers are spawned lazily on first use
 llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint64_t ram_budget)
         : n_slots(n_slots), ram_budget(ram_budget) {
@@ -159,6 +245,10 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
 
 // stop and join the I/O workers before the cache buffers and files they use are destroyed
 llama_moe_stream::~llama_moe_stream() {
+    if (pack_fd >= 0) {
+        close(pack_fd);
+        pack_fd = -1;
+    }
     {
         std::lock_guard<std::mutex> lock(mtx);
         shutting_down = true;
@@ -225,6 +315,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
     GGML_ASSERT(sl->n_expert == n_expert);
 
     sl->weights.push_back({ cache, file_idx, offs, nb_expert });
+    sl->weights.back().src_name = meta->name;
 
     max_nb_expert = std::max(max_nb_expert, nb_expert);
 
@@ -307,6 +398,18 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
         LLAMA_LOG_INFO("%s: MoE expert streaming uses O_DIRECT (page cache bypassed)\n", __func__);
     }
 
+    detect_direct_write();
+
+    {
+        std::string pack = paths.empty() ? "" : paths.front() + ".epack";
+        if (const char * e = getenv("LLAMA_MOE_STREAM_PACK")) {
+            pack = e;
+        }
+        if (!pack.empty() && access(pack.c_str(), R_OK) == 0) {
+            open_pack(pack);
+        }
+    }
+
     // one token drives ~one remap per streamed layer, so decaying every 64 tokens is
     //   64 * n_streamed_layers remap calls (computed once here, off the hot path)
     int64_t n_streamed = 0;
@@ -314,6 +417,166 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
         n_streamed += sl != nullptr;
     }
     hot_decay_interval = MOE_STREAM_HOT_DECAY_TOKENS * n_streamed;
+}
+
+
+// expert pack header, little-endian:
+//   char magic[8] = "LMEPACK1", u32 version = 1, u32 n_layer, u32 n_expert, u32 blob_align, u64 header_size
+//   per layer: u32 n_weights, u32 pad, u64 base_off, u64 blob_stride
+//     per weight: char name[96], u32 ggml_type, u32 pad, u64 nb_expert, u64 slab_off
+struct llama_moe_stream_pack_weight {
+    char     name[96];
+    uint32_t type;
+    uint32_t pad;
+    uint64_t nb_expert;
+    uint64_t slab_off;
+};
+
+void llama_moe_stream::open_pack(const std::string & path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        LLAMA_LOG_WARN("%s: expert pack %s: open failed (%s), ignored\n", __func__, path.c_str(), strerror(errno));
+        return;
+    }
+    auto fail = [&](const char * why) {
+        LLAMA_LOG_WARN("%s: expert pack %s: %s, ignored\n", __func__, path.c_str(), why);
+        close(fd);
+        for (auto & sl : layers) {
+            if (sl) { sl->packed = false; }
+        }
+    };
+
+    struct { char magic[8]; uint32_t version, n_layer, n_expert, blob_align; uint64_t header_size; } hdr;
+    if (!llama_moe_stream_pread_exact(fd, (uint8_t *) &hdr, sizeof(hdr), 0) ||
+        memcmp(hdr.magic, "LMEPACK1", 8) != 0 || hdr.version != 1) {
+        fail("bad header");
+        return;
+    }
+    if (hdr.n_layer != layers.size()) {
+        fail("layer count mismatch");
+        return;
+    }
+
+    size_t pos = sizeof(hdr);
+    uint32_t n_packed = 0;
+    for (uint32_t il = 0; il < hdr.n_layer; il++) {
+        struct { uint32_t n_weights, pad; uint64_t base_off, blob_stride; } le;
+        if (!llama_moe_stream_pread_exact(fd, (uint8_t *) &le, sizeof(le), pos)) {
+            fail("truncated layer table");
+            return;
+        }
+        pos += sizeof(le);
+        std::vector<llama_moe_stream_pack_weight> pw(le.n_weights);
+        if (le.n_weights > 0 && !llama_moe_stream_pread_exact(fd, (uint8_t *) pw.data(), pw.size()*sizeof(pw[0]), pos)) {
+            fail("truncated weight table");
+            return;
+        }
+        pos += pw.size()*sizeof(pw[0]);
+
+        auto & sl = layers[il];
+        if (!sl || le.n_weights == 0) {
+            continue;
+        }
+        if (sl->n_expert != hdr.n_expert || le.n_weights != sl->weights.size()) {
+            continue; // layer not packed for this model shape
+        }
+        bool ok = true;
+        for (auto & wt : sl->weights) {
+            bool found = false;
+            for (const auto & p : pw) {
+                if (strncmp(p.name, wt.src_name.c_str(), sizeof(p.name)) == 0) {
+                    found = p.type == (uint32_t) wt.cache->type && p.nb_expert == wt.nb_expert;
+                    if (found) {
+                        wt.pack_off = p.slab_off;
+                    }
+                    break;
+                }
+            }
+            ok = ok && found;
+        }
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: expert pack: layer %u does not match the model tensors, read from GGUF\n", __func__, il);
+            continue;
+        }
+        sl->packed      = true;
+        sl->pack_base   = le.base_off;
+        sl->pack_stride = le.blob_stride;
+        size_t nb_blob = 0;
+        for (const auto & wt : sl->weights) { nb_blob += wt.nb_expert; }
+        max_nb_blob = std::max(max_nb_blob, nb_blob);
+        n_packed++;
+    }
+
+#ifdef __APPLE__
+    if (use_direct_io) {
+        fcntl(fd, F_NOCACHE, 1);
+    }
+#endif
+    pack_fd   = fd;
+    pack_path = path;
+    LLAMA_LOG_INFO("%s: expert pack %s: %u of %zu layers packed, one read per expert\n", __func__, path.c_str(), n_packed, layers.size());
+}
+
+// A cache slab can be filled through its host pointer when the buffer is a CPU buffer or a Metal
+// shared buffer (unified memory). Verify per buffer by round-tripping a pattern through the
+// backend's own set_tensor and the raw pointer, before any expert is loaded.
+void llama_moe_stream::detect_direct_write() {
+#ifdef _WIN32
+    return;
+#else
+    if (getenv("LLAMA_MOE_STREAM_NO_DIRECT_WRITE")) {
+        return;
+    }
+    // O_DIRECT needs block-aligned destinations, which arbitrary slot offsets are not; macOS uses
+    // F_NOCACHE which has no such constraint
+#ifndef __APPLE__
+    if (use_direct_io) {
+        return;
+    }
+#endif
+    std::vector<ggml_backend_buffer_t> checked_ok, checked_bad;
+    size_t n_direct = 0, n_total = 0;
+    for (auto & sl : layers) {
+        if (!sl) {
+            continue;
+        }
+        for (auto & wt : sl->weights) {
+            n_total++;
+            ggml_backend_buffer_t buf = wt.cache->buffer;
+            if (buf == nullptr || wt.cache->data == nullptr) {
+                continue;
+            }
+            if (std::find(checked_bad.begin(), checked_bad.end(), buf) != checked_bad.end()) {
+                continue;
+            }
+            if (std::find(checked_ok.begin(), checked_ok.end(), buf) == checked_ok.end()) {
+                bool ok = ggml_backend_buffer_is_host(buf);
+                if (!ok) {
+                    const std::string name = ggml_backend_buffer_name(buf);
+                    const bool metal_shared = name.rfind("MTL", 0) == 0 &&
+                        name.find("Private") == std::string::npos && name.find("Mapped") == std::string::npos;
+                    if (metal_shared) {
+                        // round-trip: write via the backend, read via the pointer, then restore
+                        const size_t n = std::min<size_t>(4096, wt.nb_expert);
+                        std::vector<uint8_t> pat(n), back(n), zero(n, 0);
+                        for (size_t i = 0; i < n; i++) { pat[i] = (uint8_t) (0xA5 ^ (i*7)); }
+                        ggml_backend_tensor_set(wt.cache, pat.data(), 0, n);
+                        memcpy(back.data(), wt.cache->data, n);
+                        ok = back == pat;
+                        ggml_backend_tensor_set(wt.cache, zero.data(), 0, n);
+                    }
+                }
+                (ok ? checked_ok : checked_bad).push_back(buf);
+                if (!ok) {
+                    continue;
+                }
+            }
+            wt.direct_write = true;
+            n_direct++;
+        }
+    }
+    LLAMA_LOG_INFO("%s: %zu of %zu streamed weights fill their cache slots by direct read\n", __func__, n_direct, n_total);
+#endif
 }
 
 // runs n_jobs over the I/O thread pool, each thread with its own aligned staging buffer
@@ -524,7 +787,7 @@ void llama_moe_stream::start_workers_locked() {
 void llama_moe_stream::worker_loop() {
     // page-aligned staging (Metal private buffers require page-aligned source + page-multiple
     // length; O_DIRECT needs the extra head/tail slack for its aligned reads)
-    uint8_t * staging = (uint8_t *) moe_aligned_alloc(max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN);
+    uint8_t * staging = (uint8_t *) moe_aligned_alloc(std::max(max_nb_expert, max_nb_blob) + 2*MOE_STREAM_DIRECT_ALIGN);
     GGML_ASSERT(staging != nullptr);
 
     // async uploads need the buffer to sit in the device's default buffer type; anything else
@@ -578,9 +841,52 @@ void llama_moe_stream::worker_loop() {
         lk.unlock();
 
         batch_ok.assign(batch.size(), 1);
+        std::vector<iovec> iov;
         for (size_t k = 0; k < batch.size(); k++) {
             const auto & w  = batch[k];
             const auto & sl = *w.sl;
+
+            // packed expert: one contiguous blob, scattered into the slabs with a single preadv
+            const bool mirrored = !sl.weights.empty() && sl.weights[0].host != nullptr && (uint32_t) w.expert >= sl.weights[0].host_first;
+            if (sl.packed && !mirrored) {
+                bool all_direct = true;
+                size_t nb_total = 0;
+                for (const auto & wt : sl.weights) {
+                    all_direct = all_direct && wt.direct_write;
+                    nb_total  += wt.nb_expert;
+                }
+                // slabs are laid out in pack_off order; preadv needs them in file order
+                std::vector<const llama_moe_stream_weight *> order;
+                for (const auto & wt : sl.weights) { order.push_back(&wt); }
+                std::sort(order.begin(), order.end(), [](const llama_moe_stream_weight * a, const llama_moe_stream_weight * b) { return a->pack_off < b->pack_off; });
+
+                const size_t blob_offs = sl.pack_base + (size_t) w.expert*sl.pack_stride;
+                iov.clear();
+                if (all_direct) {
+                    size_t expect = 0;
+                    bool contiguous = true;
+                    for (const auto * wt : order) {
+                        contiguous = contiguous && wt->pack_off == expect;
+                        expect += wt->nb_expert;
+                        iov.push_back({ (uint8_t *) wt->cache->data + (size_t) w.slot*wt->nb_expert, wt->nb_expert });
+                    }
+                    if (!contiguous || !llama_moe_stream_preadv_exact(pack_fd, iov, blob_offs)) {
+                        batch_ok[k] = 0;
+                    }
+                } else {
+                    // staging holds the whole blob (max_nb_blob), then each slab goes through set_tensor
+                    const uint8_t * data = llama_moe_stream_pread_exact(pack_fd, staging, nb_total, blob_offs) ? staging : nullptr;
+                    if (data == nullptr) {
+                        batch_ok[k] = 0;
+                    } else {
+                        for (const auto * wt : order) {
+                            ggml_backend_tensor_set(wt->cache, data + wt->pack_off, (size_t) w.slot*wt->nb_expert, wt->nb_expert);
+                        }
+                    }
+                }
+                continue;
+            }
+
             for (const auto & wt : sl.weights) {
                 const size_t offs_slot = (size_t) w.slot*wt.nb_expert;
 
@@ -592,6 +898,16 @@ void llama_moe_stream::worker_loop() {
                         ggml_backend_tensor_set_async(be, wt.cache, data, offs_slot, wt.nb_expert);
                     } else {
                         ggml_backend_tensor_set(wt.cache, data, offs_slot, wt.nb_expert);
+                    }
+                    continue;
+                }
+
+                if (wt.direct_write) {
+                    // unified memory: read straight into the slot, no staging copy
+                    uint8_t * dst = (uint8_t *) wt.cache->data + offs_slot;
+                    if (!llama_moe_stream_pread_slot(files[wt.file_idx]->file_id(), dst, wt.nb_expert, wt.offs + (size_t) w.expert*wt.nb_expert, staging, use_direct_io)) {
+                        batch_ok[k] = 0;
+                        break;
                     }
                     continue;
                 }

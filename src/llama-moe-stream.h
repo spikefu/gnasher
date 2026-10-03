@@ -53,6 +53,10 @@ struct llama_moe_stream_weight {
 
     const uint8_t * host       = nullptr; // pinned host mirror of the unpinned experts, null when unmirrored
     uint32_t        host_first = 0;       // first expert the mirror holds
+
+    std::string src_name;      // GGUF tensor name, matched against the expert pack
+    size_t      pack_off = 0;  // byte offset of this weight's slab inside a packed expert blob
+    bool        direct_write = false; // the cache buffer is host-writable: pread straight into the slot
 };
 
 struct llama_moe_stream_layer;
@@ -73,6 +77,11 @@ struct llama_moe_stream_layer {
     uint32_t n_pinned = 0; // slots 0..n_pinned-1 permanently hold experts 0..n_pinned-1
 
     std::vector<llama_moe_stream_weight> weights; // 2 (fused gate_up + down) or 3 entries
+
+    // expert pack: all weights of one expert contiguous at pack_base + expert*pack_stride
+    bool     packed      = false;
+    uint64_t pack_base   = 0;
+    uint64_t pack_stride = 0;
 
     // residency state, guarded by mgr->mtx
     std::vector<int32_t>                 slot_expert;   // [n_slots] expert id or -1
@@ -159,10 +168,22 @@ struct llama_moe_stream {
 
     llama_files files; // privately reopened GGUF files, same indices as the loader's
 
+    // optional expert pack sidecar (<first gguf>.epack or LLAMA_MOE_STREAM_PACK): one blob per
+    // (layer, expert) holding all of its slabs, so a miss is one contiguous read
+    int         pack_fd = -1;
+    std::string pack_path;
+    void open_pack(const std::string & path);
+    bool pack_enabled() const { return pack_fd >= 0; }
+
+    // whether a cache buffer can be written through its host pointer (CPU buffers and Metal shared
+    // buffers); verified once per buffer at open time
+    void detect_direct_write();
+
     size_t ram_budget = 0; // pinned host mirror budget in bytes
     std::vector<ggml_backend_buffer_ptr> host_bufs;
 
     size_t  max_nb_expert      = 0;
+    size_t  max_nb_blob        = 0; // largest packed expert blob (sum of its slabs)
     int64_t hot_decay_interval = 0; // remap calls between route-hotness halvings (0 = no decay)
 
     std::vector<std::pair<ggml_backend_buffer_type_t, ggml_context_ptr>> ctxs; // one per buft
