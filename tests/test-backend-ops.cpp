@@ -11445,12 +11445,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // gnasher: GLM-5.3-Flash routed-expert shapes (288 experts, 8 used per token); gate/up are k=4096 m=2048,
     // down is k=2048 m=4096. Enabled with GNASHER_PERF_SHAPES=1 to compare quant-type kernel speed on Metal.
-    if (getenv("GNASHER_PERF_SHAPES") != nullptr) {
+    if (getenv("GNASHER_PERF_SHAPES") != nullptr && atoi(getenv("GNASHER_PERF_SHAPES")) == 1) {
         for (ggml_type type_a : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q4_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_IQ3_XXS}) {
             for (int n : {1, 4, 32}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, false, 2048, n, 4096));
                 test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, false, 4096, n, 2048));
             }
+        }
+        return test_cases;
+    }
+
+    // gnasher: scattered experts over a large tensor (GNASHER_PERF_SHAPES=3): 288 experts of 4096x2048, 8 used,
+    // n=8 rows so ~64 distinct experts (~300 MB) are read per run through the mat-vec path
+    if (getenv("GNASHER_PERF_SHAPES") != nullptr && atoi(getenv("GNASHER_PERF_SHAPES")) == 3) {
+        for (ggml_type type_a : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, false, 2048, 8, 4096));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, false, 4096, 8, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, false, 2048, 8, 4096)); // same bytes/run, small tensor
+        }
+        return test_cases;
+    }
+
+    // gnasher: DRAM-bound comparison of the expert-indexed matmul vs a plain matmul of equal bytes
+    // (GNASHER_PERF_SHAPES=2). 8 used experts of 16384x4096 = 285 MB at 4.25 bpw, beyond the SLC.
+    if (getenv("GNASHER_PERF_SHAPES") != nullptr && atoi(getenv("GNASHER_PERF_SHAPES")) == 2) {
+        for (ggml_type type_a : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, false, 16384, 1, 4096));
+            test_cases.emplace_back(new test_mul_mat   (type_a, GGML_TYPE_F32, 131072, 1, 4096, {1, 1}, {1, 1}));
         }
         return test_cases;
     }
