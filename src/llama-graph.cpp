@@ -2228,7 +2228,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * ids_gemm = selected_experts;
     if (msl && n_stream_waves == 1) {
         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
-        ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
+        // batched prefill runs the remap as a Metal host op inside the command buffer (registered
+        // function); single-token decode keeps the cheaper scheduler split (unregistered alias)
+        ids_gemm = ggml_map_custom1(ctx0, ids_cont, n_tokens > 1 ? llama_moe_stream_remap : llama_moe_stream_remap_decode, 1, msl);
         cb(ids_gemm, "ffn_moe_topk_stream", il);
     }
 

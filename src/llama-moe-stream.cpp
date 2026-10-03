@@ -1449,3 +1449,7 @@ void llama_moe_stream_wave_mask(ggml_tensor * dst, int ith, int nth, void * user
         out[i] = sl->expert_wave[ids[i]] == (uint8_t) w ? 1.0f : 0.0f;
     }
 }
+
+void llama_moe_stream_remap_decode(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    llama_moe_stream_remap(dst, a, ith, nth, userdata);
+}

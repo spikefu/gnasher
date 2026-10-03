@@ -231,6 +231,9 @@ struct llama_moe_stream {
 
 // callback of the id-remapping custom op inserted by build_moe_ffn
 void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+// same op under a distinct function pointer, never registered as a GPU host op: measured faster for
+// single-token decode, where the scheduler split beats a GPU-side event wait on Apple Silicon
+void llama_moe_stream_remap_decode(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
 
 // callbacks of the multi-pass prefill custom ops inserted by build_moe_ffn when a ubatch touches
 // more experts than the cache holds; each src[0] is the contiguous selected ids

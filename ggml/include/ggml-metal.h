@@ -56,6 +56,9 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
+// allow a custom-op callback to run as a host op inside Metal command buffers (also via get_proc_address)
+GGML_BACKEND_API void ggml_backend_metal_register_host_op(const void * fun);
+
 #ifdef __cplusplus
 }
 #endif

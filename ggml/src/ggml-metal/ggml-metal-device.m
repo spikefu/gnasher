@@ -11,6 +11,9 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -916,7 +919,174 @@ struct ggml_metal_device {
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
+
+    // host-callback ops: the GPU signals ev_host_gpu when the op's inputs are ready, a listener runs
+    // the callback on the CPU and raises ev_host_cpu, which the GPU waits on before continuing
+    NSLock *                 host_lock;
+    id<MTLSharedEvent>       ev_host_gpu;
+    id<MTLSharedEvent>       ev_host_cpu;
+    MTLSharedEventListener * host_listener;
+    atomic_uint_fast64_t     host_v_gpu;
+    atomic_uint_fast64_t     host_v_cpu;
 };
+
+// registry of callback functions allowed to run as host ops inside Metal command buffers
+#define GGML_METAL_HOST_OPS_MAX 32
+static const void * g_metal_host_ops[GGML_METAL_HOST_OPS_MAX];
+static int          g_metal_host_ops_n = 0;
+static NSLock *     g_metal_host_ops_lock = nil;
+
+void ggml_metal_device_register_host_op(const void * fun) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ g_metal_host_ops_lock = [[NSLock alloc] init]; });
+    [g_metal_host_ops_lock lock];
+    bool present = false;
+    for (int i = 0; i < g_metal_host_ops_n; i++) {
+        present = present || g_metal_host_ops[i] == fun;
+    }
+    if (!present && g_metal_host_ops_n < GGML_METAL_HOST_OPS_MAX) {
+        g_metal_host_ops[g_metal_host_ops_n++] = fun;
+    }
+    [g_metal_host_ops_lock unlock];
+}
+
+static const void * ggml_metal_host_op_fun(const struct ggml_tensor * op) {
+    switch (op->op) {
+        case GGML_OP_MAP_CUSTOM1: {
+            struct ggml_map_custom1_op_params p;
+            memcpy(&p, op->op_params, sizeof(p));
+            return (const void *) p.fun;
+        }
+        case GGML_OP_CUSTOM: {
+            struct ggml_custom_op_params p;
+            memcpy(&p, op->op_params, sizeof(p));
+            return (const void *) p.fun;
+        }
+        default:
+            return NULL;
+    }
+}
+
+bool ggml_metal_device_host_op_supported(ggml_metal_device_t dev, const struct ggml_tensor * op) {
+    if (!dev->props.use_shared_buffers || g_metal_host_ops_n == 0) {
+        return false; // the callback needs host pointers into the GPU buffers
+    }
+    const void * fun = ggml_metal_host_op_fun(op);
+    if (fun == NULL) {
+        return false;
+    }
+    for (int i = 0; i < g_metal_host_ops_n; i++) {
+        if (g_metal_host_ops[i] == fun) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ggml_metal_host_op_run(struct ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_MAP_CUSTOM1: {
+            struct ggml_map_custom1_op_params p;
+            memcpy(&p, node->op_params, sizeof(p));
+            p.fun(node, node->src[0], 0, 1, p.userdata);
+        } break;
+        case GGML_OP_CUSTOM: {
+            struct ggml_custom_op_params p;
+            memcpy(&p, node->op_params, sizeof(p));
+            p.fun(node, 0, 1, p.userdata);
+        } break;
+        default:
+            GGML_ABORT("not a host op");
+    }
+}
+
+// pending host ops are served in GPU order by one thread that spin-polls the GPU event value;
+// MTLSharedEventListener notifications cost a few hundred microseconds each way, a poll costs a load
+struct ggml_metal_host_op_item {
+    struct ggml_tensor * node;
+    uint64_t v_gpu;
+    uint64_t v_cpu;
+};
+
+#define GGML_METAL_HOST_OP_QUEUE 4096
+static struct {
+    struct ggml_metal_host_op_item items[GGML_METAL_HOST_OP_QUEUE];
+    atomic_uint_fast64_t head; // next to serve
+    atomic_uint_fast64_t tail; // next free
+    pthread_t thread;
+    bool      started;
+    id<MTLSharedEvent> ev_gpu;
+    id<MTLSharedEvent> ev_cpu;
+    bool      use_listener;
+} g_host_q;
+
+static void * ggml_metal_host_op_thread(void * arg) {
+    (void) arg;
+    pthread_setname_np("ggml-metal-host-ops");
+    while (true) {
+        const uint64_t head = atomic_load_explicit(&g_host_q.head, memory_order_acquire);
+        if (head == atomic_load_explicit(&g_host_q.tail, memory_order_acquire)) {
+            usleep(50); // idle: nothing encoded
+            continue;
+        }
+        const struct ggml_metal_host_op_item it = g_host_q.items[head % GGML_METAL_HOST_OP_QUEUE];
+        // wait for the GPU to reach this op
+        int spins = 0;
+        while (g_host_q.ev_gpu.signaledValue < it.v_gpu) {
+            if (++spins > 2000) {
+                sched_yield();
+            }
+        }
+        ggml_metal_host_op_run(it.node);
+        g_host_q.ev_cpu.signaledValue = it.v_cpu;
+        atomic_store_explicit(&g_host_q.head, head + 1, memory_order_release);
+    }
+    return NULL;
+}
+
+void ggml_metal_device_host_op_encode(ggml_metal_device_t dev, ggml_metal_cmd_buf_t cmd_buf_raw, struct ggml_tensor * node) {
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    [dev->host_lock lock];
+    if (dev->ev_host_gpu == nil) {
+        dev->ev_host_gpu   = [dev->mtl_device newSharedEvent];
+        dev->ev_host_cpu   = [dev->mtl_device newSharedEvent];
+        dispatch_queue_t q = dispatch_queue_create("ggml-metal-host-ops", DISPATCH_QUEUE_SERIAL);
+        dev->host_listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:q];
+        g_host_q.use_listener = getenv("GGML_METAL_HOST_OP_LISTENER") != NULL;
+        g_host_q.ev_gpu = dev->ev_host_gpu;
+        g_host_q.ev_cpu = dev->ev_host_cpu;
+        if (!g_host_q.use_listener && !g_host_q.started) {
+            pthread_create(&g_host_q.thread, NULL, ggml_metal_host_op_thread, NULL);
+            g_host_q.started = true;
+        }
+    }
+    const uint64_t v_gpu = atomic_fetch_add_explicit(&dev->host_v_gpu, 1, memory_order_relaxed) + 1;
+    const uint64_t v_cpu = atomic_fetch_add_explicit(&dev->host_v_cpu, 1, memory_order_relaxed) + 1;
+    id<MTLSharedEvent> ev_gpu = dev->ev_host_gpu;
+    id<MTLSharedEvent> ev_cpu = dev->ev_host_cpu;
+
+    if (g_host_q.use_listener) {
+        [dev->host_lock unlock];
+        [ev_gpu notifyListener:dev->host_listener atValue:v_gpu block:^(id<MTLSharedEvent> e, uint64_t v) {
+            (void) e; (void) v;
+            ggml_metal_host_op_run(node);
+            ev_cpu.signaledValue = v_cpu;
+        }];
+    } else {
+        // enqueue for the polling thread; ops are encoded (and therefore served) in GPU order
+        const uint64_t tail = atomic_load_explicit(&g_host_q.tail, memory_order_relaxed);
+        while (tail - atomic_load_explicit(&g_host_q.head, memory_order_acquire) >= GGML_METAL_HOST_OP_QUEUE) {
+            sched_yield();
+        }
+        g_host_q.items[tail % GGML_METAL_HOST_OP_QUEUE] = (struct ggml_metal_host_op_item) { node, v_gpu, v_cpu };
+        atomic_store_explicit(&g_host_q.tail, tail + 1, memory_order_release);
+        [dev->host_lock unlock];
+    }
+
+    [cmd_buf encodeSignalEvent:ev_gpu value:v_gpu];
+    [cmd_buf encodeWaitForEvent:ev_cpu value:v_cpu];
+}
 
 //
 // MTLResidenceSet wrapper
@@ -1113,6 +1283,7 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
 
     @autoreleasepool {
         if (dev->mtl_device == nil) {
+            dev->host_lock = [[NSLock alloc] init];
             dev->mtl_device = MTLCreateSystemDefaultDevice();
 
             if (dev->mtl_device) {
@@ -1554,6 +1725,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     }
 
     switch (op->op) {
+        case GGML_OP_MAP_CUSTOM1:
+        case GGML_OP_CUSTOM:
+            return ggml_metal_device_host_op_supported(dev, op);
         case GGML_OP_SCALE:
         case GGML_OP_FILL:
         case GGML_OP_CLAMP:

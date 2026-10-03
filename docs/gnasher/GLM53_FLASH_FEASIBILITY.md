@@ -248,3 +248,40 @@ LLAMA_MOE_STREAM_DYN=200 llama-server -m GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.
 The pack beside the GGUF is picked up automatically; `LLAMA_MOE_STREAM_PACK`
 overrides the path. Progress today: 7.5 -> 9.65 (cache 200 slots) -> 12.5
 tok/s (pack + uncached), with the trunk output unchanged.
+
+
+## Metal host-callback op for the remap (measured 2026-10-02, negative result)
+
+Hypothesis: the 42 per-token graph splits at the expert-id remap (a CPU custom
+op) cost ~0.5 ms each in Metal command-buffer drain and re-encode, ~20 ms per
+token. Implementation: the Metal backend claims registered custom ops and
+runs them mid-command-buffer via a pair of shared events (GPU signals when the
+router output is ready, a host thread runs the remap, GPU waits on the second
+event). Two host-side wake-up variants: MTLSharedEventListener, and a thread
+that spin-polls the event value. Code: `ggml_metal_device_host_op_*` in the
+Metal backend, `ggml_backend_metal_register_host_op`, opt-in from llama with
+`LLAMA_MOE_STREAM_METAL_HOST_OP=1`.
+
+Result, same prompt, 256 tokens, alternating runs in one session:
+
+| Model, cache | CPU split (default) | Host op, listener | Host op, spin-poll |
+| --- | ---: | ---: | ---: |
+| Qwen3.5-35B-A3B Q8, 255 slots (all hits) | 20.4-29.0 ms/token | 25.0-27.8 | 24.6 |
+| Qwen3.5-35B-A3B Q8, 24 slots packed | 49-54 ms/token, prefill 131-193 tok/s | 68 ms, prefill 199 | 50-56 ms, prefill 137-208 |
+| GLM-5.3-Flash IQ4_XS, 200 slots packed | 79.1 ms/token, prefill 44-46 | 79.2, prefill 46.5 | 78.3-80.1, prefill 46.7 |
+
+The GPU idling at an encoded event wait and resuming costs about what the
+scheduler's split-and-resubmit costs, and the host-side wake-up mechanism
+makes no difference (listener and spin-poll tie). On GLM the change is
+invisible either way, which also shows the earlier "20 ms of split overhead"
+estimate was wrong: GLM's remaining ~65 ms per token is compute. Each mode is
+deterministic with itself but the three graph shapes (resident, split,
+unsplit) produce slightly different rounding and therefore different text at
+temperature 0 after a couple of hundred tokens; none is more correct.
+
+Kept as opt-in for experimentation. The default remains the scheduler split.
+Lesson for the Swift port: owning the command stream does not remove this
+cost; the CPU has to learn the routing before the expert matmul, and any
+GPU<->CPU handoff on Apple Silicon costs a few hundred microseconds per layer.
+The only way around it is to not need the CPU per layer, which means
+GPU-resident routing tables with misses handled some other way.

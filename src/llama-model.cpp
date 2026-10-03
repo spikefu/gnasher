@@ -1700,6 +1700,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 LLAMA_LOG_WARN("%s: tensor buffer overrides (-ot/--cpu-moe) do not apply to SSD-streamed expert tensors\n", __func__);
             }
             pimpl->moe_stream = std::make_unique<llama_moe_stream>(n_layer_all, n_slots, params.moe_stream_io_threads, params.moe_stream_direct, params.moe_stream_ram);
+
+            // optional: let the Metal backend run the prefill expert-id remap as a host op inside its command
+            // buffers instead of splitting the graph. Measured neutral on Apple Silicon (the GPU-side event
+            // wait costs about what the scheduler split does), so it is opt-in: LLAMA_MOE_STREAM_METAL_HOST_OP=1
+            if (getenv("LLAMA_MOE_STREAM_METAL_HOST_OP") != nullptr) {
+                ggml_backend_reg_t reg = ggml_backend_reg_by_name("MTL");
+                if (reg == nullptr) {
+                    reg = ggml_backend_reg_by_name("Metal");
+                }
+                if (reg != nullptr) {
+                    auto * register_host_op = (void (*)(const void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_register_host_op");
+                    if (register_host_op) {
+                        register_host_op((const void *) llama_moe_stream_remap);
+                        register_host_op((const void *) llama_moe_stream_wave_ids);
+                        register_host_op((const void *) llama_moe_stream_wave_mask);
+                        LLAMA_LOG_INFO("%s: MoE expert streaming: prefill remap runs as a Metal host op (no graph split); decode keeps the split\n", __func__);
+                    }
+                }
+            }
             LLAMA_LOG_INFO("%s: MoE expert SSD streaming enabled, %u of %u experts cached per layer, %d I/O threads\n",
                     __func__, n_slots, hparams.n_expert, pimpl->moe_stream->n_io_threads);
         }

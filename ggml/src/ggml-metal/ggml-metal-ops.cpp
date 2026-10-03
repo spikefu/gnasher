@@ -15,6 +15,10 @@
 #include <limits>
 #include <cmath>
 
+struct ggml_metal_op;
+typedef struct ggml_metal_op * ggml_metal_op_t;
+static int ggml_metal_op_host_callback(ggml_metal_op_t ctx, int idx);
+
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
         return { nullptr, 0 };
@@ -39,6 +43,7 @@ struct ggml_metal_op {
         bool use_capture,
         int  debug_graph) {
         this->dev             = dev;
+        this->cmd_buf         = cmd_buf;
         this->lib             = ggml_metal_device_get_library(dev);
         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
         this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
@@ -98,6 +103,7 @@ struct ggml_metal_op {
     }
 
     ggml_metal_device_t  dev;
+    ggml_metal_cmd_buf_t cmd_buf;
     ggml_metal_library_t lib;
     ggml_metal_encoder_t enc;
     ggml_mem_ranges_t    mem_ranges;
@@ -280,6 +286,11 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     }
 
     switch (node->op) {
+        case GGML_OP_MAP_CUSTOM1:
+        case GGML_OP_CUSTOM:
+            {
+                n_fuse = ggml_metal_op_host_callback(ctx, idx);
+            } break;
         case GGML_OP_CONCAT:
             {
                 n_fuse = ggml_metal_op_concat(ctx, idx);
@@ -533,6 +544,24 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     }
 
     return n_fuse;
+}
+
+// A registered CPU callback in the middle of the command buffer. The current encoder is closed so
+// everything before it is ordered ahead of the GPU-side signal; the device wires a listener that runs
+// the callback and releases the GPU wait. No graph split, no command-buffer drain.
+static int ggml_metal_op_host_callback(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * node = ctx->node(idx);
+
+    ggml_metal_op_concurrency_reset(ctx);
+
+    ggml_metal_encoder_end_encoding(ctx->enc);
+    ggml_metal_encoder_free(ctx->enc);
+
+    ggml_metal_device_host_op_encode(ctx->dev, ctx->cmd_buf, node);
+
+    ctx->enc = ggml_metal_encoder_init(ctx->cmd_buf, ctx->use_concurrency);
+
+    return 1;
 }
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
