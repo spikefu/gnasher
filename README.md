@@ -73,7 +73,10 @@ disables it).
 Experimental switches measured on an M5 Max (see `docs/gnasher/GLM53_FLASH_FEASIBILITY.md`):
 `GGML_METAL_KEEP_WARM=pulse` keeps the GPU clocked through the per-layer CPU gaps of expert
 streaming (+9% decode, idle between requests; `=1` runs continuously); `LLAMA_MOE_STREAM_METAL_HOST_OP=1` runs the prefill remap inside the Metal command
-buffer (neutral); `GNASHER_PROFILE_OPS=1` prints a per-op time profile from `llama-completion`.
+buffer (neutral); `GNASHER_PROFILE_OPS=1` prints a per-op time profile from `llama-completion`; `GGML_SCHED_PROFILE=1`
+apportions scheduler split-loop time; `scripts/gnasher-bench/gpu-trace.sh` records a Metal System Trace (needs Xcode).
+The Metal lightning-indexer kernel accepts any head count that is a multiple of 8 up to 64, so GLM-5.3-Flash's
+32-head sparse attention runs on the GPU (`GGML_METAL_INDEXER_CPU=1` restores the CPU path).
 
 ### Example: GLM-5.3-Flash on a Mac
 

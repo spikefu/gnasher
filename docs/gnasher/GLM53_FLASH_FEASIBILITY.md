@@ -469,3 +469,34 @@ Levers this exposes, with the ms they address:
    token) and a cheaper wait (spin on command-buffer status briefly before
    blocking, to avoid the thread wake-up on every split).
 3. Encode (4.4): already small.
+
+## Three per-layer levers, measured (2026-10-02)
+
+GLM-5.3-Flash, 200 slots, packed, uncached, pulsed keep-warm, 128 tokens
+after the 480-token prompt, alternating runs:
+
+| change | splits/token | ms/token | verdict |
+| --- | ---: | ---: | --- |
+| none | 108 | 75.3, 75.0 | |
+| lightning indexer on Metal (32 heads) | 86 | 72.2, 72.4 | **-4%, default on**; text identical to the CPU indexer |
+| chunked reads, 4 per miss | 108 | 74.2 | within noise; kept (default 4) |
+| spin 1.5 ms before the blocking GPU wait | 108 | 81.1 | worse; off |
+| indexer + chunks + spin | 86 | 73.3 | |
+
+The indexer change is one runtime argument: the Metal kernel had its head
+count hard-coded to DeepSeek V4's 64; GLM's indexer has 32 heads and fell back
+to the CPU, costing a GPU round trip per sparse-attention layer.
+
+Why chunked reads do not help in situ: decode-only statistics (short prompt)
+show the remap-to-worker handoff at 0.026 ms per load and the read itself at
+1.71-1.79 ms per 11.3 MB expert for 1, 4 or 8 chunks alike, i.e. ~6.6 GB/s.
+That is the SSD's sustained rate; an isolated microbenchmark looked 2-3x
+faster only because recent runs had left blobs in the page cache (F_NOCACHE
+still serves cached pages). The I/O term is bandwidth-bound: fewer misses
+(RAM), fewer bytes (precision) or more drives are the only ways down.
+
+Remaining per-token budget at 200 slots (~72 ms): ~28 ms SSD stall, ~17 ms GPU
+execution, ~20 ms GPU launch/complete/wake latency across 43 Metal splits,
+~4 ms encode. The latency bucket is now the largest soft target; the only
+structural fix is fewer or cheaper CPU<->GPU round trips, which the host-op
+experiment showed the Metal event mechanism cannot provide.
