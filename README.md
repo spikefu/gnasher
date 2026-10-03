@@ -77,8 +77,12 @@ GLM-5.3-Flash is natively multimodal; the Unsloth repo ships its vision tower as
 server command; images and video (`image_url`, `input_video`, ffmpeg in PATH) then work
 through the OpenAI-compatible API. The loader accepts Unsloth's `glm5next` projector naming
 and its missing pixel-limit keys. Budget about 4 cache slots for it. Measured: a 640x488
-image is ~370 tokens, prefilled at 36 tok/s; decode is unchanged. Video frames are encoded
-one by one (no temporal pair merge yet), so clips cost about twice the reference token count.
+image is ~370 tokens, prefilled at 36 tok/s; decode is unchanged.
+
+Video follows the reference processor: frames are sampled at 2 fps (override with
+`--video-fps`), embedded in temporal pairs through the two patch kernels, and laid out as
+`<|begin_of_video|>` + per pair `<|begin_of_image|> ... <|end_of_image|>T seconds` +
+`<|end_of_video|>`. A 10 s 720x358 clip is ~3.4k prompt tokens, prefilled at ~60 tok/s.
 
 ### Lookahead prefetch
 

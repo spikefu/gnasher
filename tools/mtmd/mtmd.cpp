@@ -2285,6 +2285,17 @@ void mtmd_bitmap_set_mergeable(mtmd_bitmap * bitmap, bool mergeable) {
     bitmap->mergeable = mergeable;
 }
 
+mtmd_video_style mtmd_get_video_style(const mtmd_context * ctx) {
+    mtmd_video_style style = { "Video:", nullptr, nullptr, 0, 0.0f };
+    if (ctx->ctx_v && clip_get_projector_type(ctx->ctx_v) == PROJECTOR_TYPE_GLM5V) {
+        // Glm5NextProcessor: <|begin_of_video|> then per frame pair
+        //   <|begin_of_image|> ... <|end_of_image|>{t:.1f} seconds  (t = time of the pair's first frame)
+        // then <|end_of_video|>; frames sampled at 2 fps
+        style = { "<|begin_of_video|>", "<|end_of_video|>", "%.1f seconds", 2, 2.0f };
+    }
+    return style;
+}
+
 mtmd_bitmap * mtmd_bitmap_init_lazy(const mtmd_context * ctx,
                                     const char * id,
                                     void * user_data,

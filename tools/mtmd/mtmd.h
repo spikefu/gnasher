@@ -187,6 +187,18 @@ MTMD_API void         mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id);
 // if true, this bitmap can be merged (temporal merge) with an adjacent mergeable bitmap by certain video input models
 MTMD_API void         mtmd_bitmap_set_mergeable(mtmd_bitmap * bitmap, bool mergeable);
 
+// model-specific video prompt layout, so the video helper can mimic the model's reference processor.
+// strings are static and valid for the process lifetime
+struct mtmd_video_style {
+    const char * prompt_start;          // text before the first frame (default "Video:")
+    const char * prompt_end;            // text after the last frame, NULL for none
+    const char * timestamp_fmt;         // printf format of a frame time in seconds, emitted after each group of
+                                        // n_frames_per_timestamp frames; NULL = helper default (interval timestamps)
+    int32_t      n_frames_per_timestamp;
+    float        fps;                   // the reference processor's sampling rate, <= 0 for no preference
+};
+MTMD_API struct mtmd_video_style mtmd_get_video_style(const mtmd_context * ctx);
+
 // mtmd_bitmap lazy
 //
 // this is a special bitmap that:

@@ -9,7 +9,6 @@ ggml_cgraph * clip_graph_glm4v::build() {
     norm_type norm_t = NORM_TYPE_RMS;
 
     ggml_tensor * inp_raw = build_inp_raw();
-    ggml_tensor * inp = ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
 
     int mrope_sections[4] = {d_head/4, d_head/4, d_head/4, d_head/4};
     ggml_tensor * positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches * 4);
@@ -19,10 +18,23 @@ ggml_cgraph * clip_graph_glm4v::build() {
     GGML_ASSERT(img.nx() % (patch_size * 2) == 0);
     GGML_ASSERT(img.ny() % (patch_size * 2) == 0);
 
-    // second conv dimension
+    // temporal patch of size 2: the two conv kernels see two frames. a still image (or a lone trailing
+    // video frame) is the same frame twice, a video pair (n_batch == 2) is frame t and frame t+1
+    ggml_tensor * inp = nullptr;
     {
-        auto inp_1 = ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
-        inp = ggml_add(ctx0, inp, inp_1);
+        ggml_tensor * frame_0 = inp_raw;
+        ggml_tensor * frame_1 = inp_raw;
+        if (n_batch == 2) {
+            const size_t nb1 = ggml_row_size(inp_raw->type, img.nx());
+            const size_t nb2 = ggml_row_size(inp_raw->type, img.nx() * img.ny());
+            frame_0 = ggml_view_3d(ctx0, inp_raw, img.nx(), img.ny(), 3, nb1, nb2, 0);
+            frame_1 = ggml_view_3d(ctx0, inp_raw, img.nx(), img.ny(), 3, nb1, nb2, nb2 * 3);
+        } else {
+            GGML_ASSERT(n_batch == 1 && "glm4v/glm5v: only a still image or a frame pair is supported");
+        }
+        inp = ggml_add(ctx0,
+            ggml_conv_2d(ctx0, model.patch_embeddings_0, frame_0, patch_size, patch_size, 0, 0, 1, 1),
+            ggml_conv_2d(ctx0, model.patch_embeddings_1, frame_1, patch_size, patch_size, 0, 0, 1, 1));
 
         inp = ggml_permute(ctx0, inp, 1, 2, 0, 3);  // [w, h, c, b] -> [c, w, h, b]
         inp = ggml_cont_4d(

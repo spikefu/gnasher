@@ -595,8 +595,46 @@ struct mtmd_helper_video {
     int32_t current_frame = 0;
 
     std::string prompt_start         = "Video:";
+    std::string prompt_end;                   // emitted once after the last frame (model-specific)
+    std::string timestamp_fmt;                // model-specific per-frame-group timestamp, overrides the interval style
+    int32_t     n_frames_per_timestamp = 0;
+    int32_t     n_frames_stamped       = 0;   // frames already covered by an emitted timestamp
+    bool        end_emitted            = false;
     int32_t     timestamp_interval_ms = 5000; // emit a timestamp text every N ms (0 = disabled)
     float       next_timestamp_ms     = 0.0f; // next elapsed-ms threshold at which to emit
+
+    // adopt the model's reference video layout (markers, timestamps, sampling rate)
+    void apply_style(const mtmd_video_style & style, float & fps_target_arg) {
+        if (style.prompt_start) {
+            prompt_start = style.prompt_start;
+        }
+        if (style.prompt_end) {
+            prompt_end = style.prompt_end;
+        }
+        if (style.timestamp_fmt && style.n_frames_per_timestamp > 0) {
+            timestamp_fmt          = style.timestamp_fmt;
+            n_frames_per_timestamp = style.n_frames_per_timestamp;
+        }
+        // an explicit --video-fps wins; the library default defers to the model's rate
+        if (style.fps > 0.0f && fps_target_arg == mtmd_helper_video_init_params_default().fps_target) {
+            fps_target_arg = style.fps;
+        }
+    }
+
+    // the model-style timestamp of the frames since the last one, if a group completed (or at EOF)
+    bool emit_group_timestamp(bool at_eof) {
+        if (timestamp_fmt.empty() || current_frame <= n_frames_stamped) {
+            return false;
+        }
+        if (!at_eof && current_frame - n_frames_stamped < n_frames_per_timestamp) {
+            return false;
+        }
+        char ts_buf[64];
+        snprintf(ts_buf, sizeof(ts_buf), timestamp_fmt.c_str(), (double) n_frames_stamped / info.fps);
+        pending_text = ts_buf;
+        n_frames_stamped = current_frame;
+        return true;
+    }
 
     std::vector<uint8_t> frame_buf;
     std::string pending_text; // text queued to be returned before the next frame
@@ -808,7 +846,10 @@ struct mtmd_helper_video {
                 __func__, (int)sp.alive, (int)start_emitted, current_frame);
 
         if (!sp.alive) {
-            return (current_frame == 0) ? -2 : -1;
+            if (current_frame == 0) {
+                return -2;
+            }
+            return finish(out_text);
         }
 
         if (!start_emitted) {
@@ -820,10 +861,14 @@ struct mtmd_helper_video {
         }
 
         mtmd_bitmap * frame = read_next_frame();
-        if (!frame) return -1;
+        if (!frame) {
+            return finish(out_text);
+        }
         *out_bitmap = frame;
 
-        if (timestamp_interval_ms > 0) {
+        if (!timestamp_fmt.empty()) {
+            emit_group_timestamp(false);
+        } else if (timestamp_interval_ms > 0) {
             // current_frame was already incremented by read_next_frame(); undo for elapsed calc
             float elapsed_ms = (float)(current_frame - 1) / info.fps * 1000.0f;
             if (elapsed_ms >= next_timestamp_ms) {
@@ -838,6 +883,16 @@ struct mtmd_helper_video {
         }
 
         return 0;
+    }
+
+    // after the last frame: the timestamp of an incomplete trailing group, then the end marker, then EOF
+    int32_t finish(char ** out_text) {
+        if (emit_group_timestamp(true) || (!prompt_end.empty() && !end_emitted && (end_emitted = true, pending_text = prompt_end, true))) {
+            *out_text = strdup(pending_text.c_str());
+            pending_text.clear();
+            return *out_text ? 0 : -2;
+        }
+        return -1;
     }
 
     static float parse_rational(const char * s) {
@@ -931,6 +986,7 @@ mtmd_helper_video * mtmd_helper_video_init(
     ctx->ffmpeg_bin           = video_resolve_bin(params.ffmpeg_bin_dir, "ffmpeg");
     ctx->ffprobe_bin          = video_resolve_bin(params.ffmpeg_bin_dir, "ffprobe");
     ctx->timestamp_interval_ms = params.timestamp_interval_ms;
+    ctx->apply_style(mtmd_get_video_style(mctx), params.fps_target);
 
     if (!ctx->probe(params.fps_target)) {
         LOG_ERR("%s: ffprobe failed for '%s' (is ffprobe in PATH?)\n", __func__, path);
@@ -966,6 +1022,7 @@ mtmd_helper_video * mtmd_helper_video_init_from_buf(
     ctx->ffmpeg_bin            = video_resolve_bin(params.ffmpeg_bin_dir, "ffmpeg");
     ctx->ffprobe_bin           = video_resolve_bin(params.ffmpeg_bin_dir, "ffprobe");
     ctx->timestamp_interval_ms = params.timestamp_interval_ms;
+    ctx->apply_style(mtmd_get_video_style(mctx), params.fps_target);
 
     if (!ctx->probe(params.fps_target)) {
         LOG_ERR("%s: ffprobe failed on buffer (is ffprobe in PATH?)\n", __func__);
