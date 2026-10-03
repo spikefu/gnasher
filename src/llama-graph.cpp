@@ -2056,6 +2056,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    ggml_tensor * ffn_in = cur; // the router input, also fed to the lookahead routers of the streamed next layers
+
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
@@ -2228,9 +2230,51 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * ids_gemm = selected_experts;
     if (msl && n_stream_waves == 1) {
         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
+
+        // lookahead prefetch: run the next layers' routers on this layer's input. the residual stream
+        // changes little between adjacent layers, so their top-k on it predicts their real routing well
+        // enough to start loading the predicted misses now, overlapping the SSD reads with the GEMMs of
+        // this layer and the attention of the next. the prediction only feeds the loader - the real
+        // routing of every layer is still computed and used, so the outputs do not change
+        ggml_tensor * pred_ids = nullptr;
+        const bool plain_router = probs_in == nullptr && selected_experts_in == nullptr && hparams.n_expert_groups <= 1 &&
+                                  arch != LLM_ARCH_LLAMA4 && arch != LLM_ARCH_GROVEMOE && n_tokens <= 16;
+        if (mstream->lookahead > 0 && plain_router) {
+            for (int d = 1; d <= mstream->lookahead; d++) {
+                const llama_moe_stream_layer * nsl = mstream->layer(il + d);
+                if (nsl == nullptr || nsl->gate_inp == nullptr || nsl->n_expert != (uint32_t) n_expert) {
+                    break;
+                }
+                ggml_tensor * lg = build_lora_mm(nsl->gate_inp, ffn_in); // [n_expert, n_tokens]
+                if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+                    ggml_prec_set_acc(lg, GGML_PREC_F32);
+                }
+                ggml_tensor * lp = nullptr;
+                switch (gating_op) {
+                    case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:        lp = ggml_soft_max(ctx0, lg); break;
+                    case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:        lp = ggml_sigmoid(ctx0, lg);  break;
+                    case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT: lp = lg;                      break;
+                    case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:  lp = ggml_sqrt(ctx0, ggml_softplus(ctx0, lg)); break;
+                    default: GGML_ABORT("fatal error");
+                }
+                if (nsl->exp_probs_b != nullptr) {
+                    lp = ggml_add(ctx0, lp, nsl->exp_probs_b);
+                }
+                ggml_tensor * lids = ggml_argsort_top_k(ctx0, lp, n_expert_used); // [n_expert_used, n_tokens]
+                cb(lids, "ffn_moe_lookahead_ids", il);
+                pred_ids = pred_ids ? ggml_concat(ctx0, pred_ids, lids, 2) : lids;
+            }
+        }
+
         // batched prefill runs the remap as a Metal host op inside the command buffer (registered
         // function); single-token decode keeps the cheaper scheduler split (unregistered alias)
-        ids_gemm = ggml_map_custom1(ctx0, ids_cont, n_tokens > 1 ? llama_moe_stream_remap : llama_moe_stream_remap_decode, 1, msl);
+        if (pred_ids != nullptr) {
+            pred_ids = ggml_cont(ctx0, pred_ids);
+            ids_gemm = ggml_map_custom2(ctx0, ids_cont, pred_ids,
+                    n_tokens > 1 ? llama_moe_stream_remap2 : llama_moe_stream_remap2_decode, 1, msl);
+        } else {
+            ids_gemm = ggml_map_custom1(ctx0, ids_cont, n_tokens > 1 ? llama_moe_stream_remap : llama_moe_stream_remap_decode, 1, msl);
+        }
         cb(ids_gemm, "ffn_moe_topk_stream", il);
     }
 

@@ -2026,6 +2026,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->moe_stream.reset();
         } else {
             pimpl->moe_stream->alloc_bufs(ml.no_alloc);
+            // the routers of the streamed layers, for lookahead prefetch
+            for (int il = 0; il < (int) layers.size(); il++) {
+                if (llama_moe_stream_layer * sl = pimpl->moe_stream->layer(il)) {
+                    sl->gate_inp    = layers[il].ffn_gate_inp;
+                    sl->exp_probs_b = layers[il].ffn_exp_probs_b;
+                }
+            }
             if (!ml.no_alloc) {
                 pimpl->moe_stream->open_files(ml.file_paths);
                 pimpl->moe_stream->pin_partition(hparams.n_expert_used_max());

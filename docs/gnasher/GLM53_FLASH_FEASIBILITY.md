@@ -500,3 +500,49 @@ execution, ~20 ms GPU launch/complete/wake latency across 43 Metal splits,
 ~4 ms encode. The latency bucket is now the largest soft target; the only
 structural fix is fewer or cheaper CPU<->GPU round trips, which the host-op
 experiment showed the Metal event mechanism cannot provide.
+
+## Lookahead expert prefetch (measured 2026-10-03)
+
+The SSD stall (~28 ms of ~72 ms per token) was fully serialized with compute:
+a layer's misses are only known once its router has run. The fix in the graph:
+layer L also evaluates layer L+1's router (gate matmul, sigmoid, bias, top-8)
+on L's own normalized FFN input, and the remap custom op receives both the
+real ids of L and the predicted ids of L+1. Predicted experts that are not
+resident in L+1's cache are reserved (coldest slot, never another predicted
+expert) and queued at low priority; when L+1's real remap arrives it finds
+them resident or in flight. Only the loader sees the prediction; outputs are
+byte-identical (same hash in every run below).
+
+Predictor accuracy, GLM-5.3-Flash IQ4_XS, 128 decode tokens after a 480-token prompt:
+
+| distance | confirmed | by rank 1..8 | demand misses the prediction contained |
+| --- | ---: | --- | ---: |
+| 1 | 67.9% | 98/93/85/74/63/53/42/35% | 57% (1733/3053) |
+| 2 | 57.8% | 94/84/72/61/51/39/34/28% | 45% |
+
+Throughput, 200 slots, packed, uncached, pulsed keep-warm, indexer on Metal:
+
+| config | hit rate | stall (128 tok) | prefetches (used) | tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| off | 86.3% | 3.55 s | | 14.03 |
+| distance 1, all ranks | 89.6% | 2.88 s | 3134 (52%) | **14.85, 14.81** |
+| distance 1, ranks 1-6 | | | 2172 (62%) | 14.60 |
+| distance 1, ranks 1-5 | | | 1691 (68%) | 14.51 |
+| distance 1 + hotness guard on the victim | 89.6% | 2.91 s | 3134 (52%) | 14.71 |
+| distance 2, all ranks | 89.8% | 3.22 s | 1523 + 3017 | 14.02 |
+| distance 2, ranks 8 / 3 | | | 2439 + 837 | 14.52 |
+| distance 2, ranks 6 / 3 | | | 1490 + 856 | 14.59 |
+
+Distance 1 with all ranks is the default (+6%). Capping ranks saves wasted
+reads (about half the prefetches are wrong) but loses more hits than it
+saves bandwidth; the SSD has headroom beyond the demand reads. Distance 2
+adds a second stream of lower-accuracy reads that compete with the
+distance-1 ones and gains nothing.
+
+Why the stall only fell from 28 to 22 ms per token: a prefetch is issued at
+L's remap and demanded at L+1's remap about 1 ms later, while an 11.3 MB
+expert takes ~1.7 ms to read, so even a correct prediction still stalls for
+part of its read; and 32% of the real experts were not predicted at all.
+More lead time would need the prediction earlier in the layer (e.g. from the
+pre-attention residual, model-specific plumbing), or a better predictor than
+the next layer's own router.

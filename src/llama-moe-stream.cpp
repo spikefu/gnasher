@@ -286,6 +286,28 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
 
     debug         = std::getenv("LLAMA_MOE_STREAM_DEBUG") != nullptr;
     use_direct_io = direct;
+
+    if (const char * e = std::getenv("LLAMA_MOE_STREAM_LOOKAHEAD")) {
+        lookahead = std::max(0, std::min(4, atoi(e)));
+    }
+    if (const char * e = std::getenv("LLAMA_MOE_STREAM_LOOKAHEAD_K")) {
+        // "6" applies to every distance, "8,4" per distance (the last value repeats)
+        int last = 0;
+        for (int d = 0; d < 4; d++) {
+            if (e && *e) {
+                last = std::max(0, atoi(e));
+                const char * comma = strchr(e, ',');
+                e = comma ? comma + 1 : nullptr;
+            }
+            lookahead_k[d] = last;
+        }
+    }
+    lookahead_stat = std::getenv("LLAMA_MOE_STREAM_LOOKAHEAD_STAT") != nullptr;
+    if (lookahead > 0) {
+        LLAMA_LOG_INFO("%s: MoE expert streaming lookahead prefetch: distance %d, ranks %s%s\n",
+                __func__, lookahead, lookahead_k[0] > 0 ? std::to_string(lookahead_k[0]).c_str() : "all",
+                lookahead_stat ? " (measure only)" : "");
+    }
 }
 
 // stop and join the I/O workers before the cache buffers and files they use are destroyed
@@ -298,6 +320,7 @@ llama_moe_stream::~llama_moe_stream() {
         std::lock_guard<std::mutex> lock(mtx);
         shutting_down = true;
         q_demand.clear();
+        q_prefetch.clear();
     }
     cv_work.notify_all();
     for (auto & w : workers) {
@@ -871,15 +894,22 @@ void llama_moe_stream::worker_loop() {
 
     std::unique_lock<std::mutex> lk(mtx);
     while (true) {
-        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty(); });
+        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty() || !q_prefetch.empty(); });
         if (shutting_down) {
             break;
         }
 
         batch.clear();
-        while (!q_demand.empty() && batch.size() < MOE_STREAM_UPLOAD_BATCH) {
-            llama_moe_stream_work w = q_demand.front();
-            q_demand.pop_front();
+        while ((!q_demand.empty() || !q_prefetch.empty()) && batch.size() < MOE_STREAM_UPLOAD_BATCH) {
+            // demand loads first; a prefetch item is taken only when nothing is waiting on a read
+            auto & q = !q_demand.empty() ? q_demand : q_prefetch;
+            llama_moe_stream_work w = q.front();
+            q.pop_front();
+            if (&q == &q_prefetch && !batch.empty()) {
+                // a prefetch never rides along in a demand batch (it would delay the demand commit)
+                q.push_front(w);
+                break;
+            }
 
             auto & sl = *w.sl;
             if (w.gen != sl.slot_gen[w.slot] ||
@@ -1095,6 +1125,22 @@ void llama_moe_stream::print_stats() const {
         LLAMA_LOG_INFO("%s: moe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms\n",
                 __func__, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0);
     }
+    for (int d = 0; d < lookahead; d++) {
+        if (stats.pred_n[d] == 0) {
+            continue;
+        }
+        std::string ranks;
+        for (int r = 0; r < 16 && stats.pred_rank_n[d][r] > 0; r++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%s%.0f", r ? "/" : "", 100.0*stats.pred_rank_hit[d][r]/stats.pred_rank_n[d][r]);
+            ranks += buf;
+        }
+        LLAMA_LOG_INFO("%s: moe stream: lookahead d=%d: predictions = %" PRId64 ", confirmed = %.1f%% (by rank %s%%), "
+                "demand misses covered = %" PRId64 "/%" PRId64 ", prefetches = %" PRId64 " (used = %" PRId64 ", %.1f%%)\n",
+                __func__, d + 1, stats.pred_n[d], 100.0*stats.pred_hit[d]/stats.pred_n[d], ranks.c_str(),
+                stats.pred_miss_covered[d], stats.pred_miss[d], stats.pred_fetch[d], stats.pred_fetch_used[d],
+                stats.pred_fetch[d] > 0 ? 100.0*stats.pred_fetch_used[d]/stats.pred_fetch[d] : 0.0);
+    }
 }
 
 // custom-op callback (single-threaded on ith 0): given the router's expert ids, ensure every touched
@@ -1124,14 +1170,106 @@ struct llama_moe_stream_warm_guard {
     ~llama_moe_stream_warm_guard() { if (llama_moe_stream_warm_fn) { llama_moe_stream_warm_fn(false); } }
 };
 
-void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
-    GGML_UNUSED(nth);
-    if (ith != 0) {
+// scores this layer's earlier predictions against the real routing (ids already in sl->uniq/touched,
+// misses flagged in miss_of) and invalidates them
+static void llama_moe_stream_score_predictions(llama_moe_stream_layer * sl, const std::vector<uint8_t> & is_miss) {
+    auto * mgr = sl->mgr;
+    for (size_t d = 0; d < sl->pred.size(); d++) {
+        auto & pr = sl->pred[d];
+        if (!pr.valid) {
+            continue;
+        }
+        pr.valid = false;
+        std::vector<uint8_t> predicted(sl->n_expert, 0);
+        for (size_t i = 0; i < pr.ids.size(); i++) {
+            const int32_t e = pr.ids[i];
+            if (e < 0 || (uint32_t) e >= sl->n_expert) {
+                continue;
+            }
+            const bool hit = sl->touched[e] != 0;
+            predicted[e] = 1;
+            mgr->stats.pred_n[d]++;
+            mgr->stats.pred_hit[d] += hit;
+            const int r = pr.n_per_token > 0 ? (int) (i % pr.n_per_token) : 0;
+            if (r < 16) {
+                mgr->stats.pred_rank_n[d][r]++;
+                mgr->stats.pred_rank_hit[d][r] += hit;
+            }
+        }
+        for (const int32_t e : sl->uniq) {
+            if (is_miss[e]) {
+                mgr->stats.pred_miss[d]++;
+                mgr->stats.pred_miss_covered[d] += predicted[e];
+            }
+        }
+        for (const int32_t e : pr.fetched) {
+            mgr->stats.pred_fetch_used[d] += sl->touched[e] != 0;
+        }
+        pr.fetched.clear();
+    }
+}
+
+// records layer L's prediction for layer L+d and prefetches the predicted experts that are not
+// resident (lowest-priority loads into the coldest slots). called under mgr->mtx
+static void llama_moe_stream_lookahead_locked(llama_moe_stream_layer * sl, int d,
+        const int32_t * pred_ids, int64_t n_per_token, int64_t n_tokens) {
+    auto * mgr = sl->mgr;
+    llama_moe_stream_layer * nl = mgr->layer(sl->il + d);
+    if (nl == nullptr) {
         return;
     }
+    if ((size_t) d > nl->pred.size()) {
+        nl->pred.resize(d);
+    }
+    auto & pr = nl->pred[d - 1];
+    const int64_t n = n_per_token*n_tokens;
+    pr.ids.assign(pred_ids, pred_ids + n);
+    pr.n_per_token = (int32_t) n_per_token;
+    pr.valid = true;
+    pr.fetched.clear();
+
+    if (mgr->lookahead_stat) {
+        return;
+    }
+
+    // predicted experts are kept out of victim selection, so one prediction never evicts another
+    std::vector<uint8_t> keep(nl->n_slots, 0);
+    std::vector<int32_t> want;
+    const int64_t k = mgr->lookahead_k[d - 1] > 0 ? std::min<int64_t>(mgr->lookahead_k[d - 1], n_per_token) : n_per_token;
+    for (int64_t i = 0; i < n; i++) {
+        const int32_t e = pred_ids[i];
+        if (e < 0 || (uint32_t) e >= nl->n_expert) {
+            continue;
+        }
+        const auto it = nl->expert_slot.find(e);
+        if (it != nl->expert_slot.end()) {
+            keep[it->second] = 1;
+            continue;
+        }
+        if (i % n_per_token < k && std::find(want.begin(), want.end(), e) == want.end()) {
+            want.push_back(e);
+        }
+    }
+    for (const int32_t e : want) {
+        const int32_t v = mgr->pick_victim_locked(*nl, keep.data());
+        if (v < 0) {
+            break;
+        }
+        // the victim is the coldest resident expert; a wrong prediction costs one read and that slot.
+        // (refusing victims hotter than the predicted expert measured no better)
+        mgr->reserve_slot_locked(*nl, e, v);
+        keep[v] = 1;
+        mgr->q_prefetch.push_back({ nl, e, v, nl->slot_gen[v], ggml_time_us() });
+        mgr->cv_work.notify_one();
+        mgr->stats.pred_fetch[d - 1]++;
+        pr.fetched.push_back(e);
+    }
+}
+
+static void llama_moe_stream_remap_impl(llama_moe_stream_layer * sl, const ggml_tensor * a, ggml_tensor * dst,
+        const ggml_tensor * pred_ids) {
     llama_moe_stream_warm_guard warm_guard;
 
-    auto * sl  = (llama_moe_stream_layer *) userdata;
     auto * mgr = sl->mgr;
 
     GGML_ASSERT(a->type == GGML_TYPE_I32);
@@ -1189,11 +1327,14 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     sl->demand_slots.clear();
 
     bool waited = false;
+    static thread_local std::vector<uint8_t> is_miss;
+    is_miss.assign(sl->n_expert, 0);
     for (const int32_t e : sl->uniq) {
         const auto it = sl->expert_slot.find(e);
         if (it != sl->expert_slot.end()) {
             const int32_t s = it->second;
             if (sl->slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
+                // a load is queued or in flight (a prefetch, or a sibling token's miss): make sure it is served at demand priority
                 mgr->q_demand.push_back({ sl, e, s, sl->slot_gen[s], ggml_time_us() });
                 mgr->cv_work.notify_one();
                 waited = true;
@@ -1220,6 +1361,24 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
             waited = true;
             sl->keep[v] = 1;
             sl->demand_slots.push_back(v);
+            is_miss[e] = 1;
+        }
+    }
+
+    // lookahead: score what earlier layers predicted for this one, then predict and prefetch for the
+    // next layers while this layer's own misses load
+    if (!sl->pred.empty()) {
+        llama_moe_stream_score_predictions(sl, is_miss);
+    }
+    if (pred_ids != nullptr && mgr->lookahead > 0) {
+        GGML_ASSERT(pred_ids->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(pred_ids));
+        const int64_t n_per_token = pred_ids->ne[0];
+        const int64_t n_tokens    = pred_ids->ne[1];
+        const int64_t n_dist      = pred_ids->ne[2];
+        for (int64_t d = 1; d <= n_dist && d <= mgr->lookahead; d++) {
+            const int64_t off = (d - 1)*n_per_token*n_tokens;
+            llama_moe_stream_lookahead_locked(sl, (int) d, (const int32_t *) pred_ids->data + off, n_per_token, n_tokens);
         }
     }
 
@@ -1247,6 +1406,26 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         sl->slot_last_use[s] = ++sl->use_counter;
         out[i] = s;
     }
+}
+
+void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    llama_moe_stream_remap_impl((llama_moe_stream_layer *) userdata, a, dst, nullptr);
+}
+
+void llama_moe_stream_remap2(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    llama_moe_stream_remap_impl((llama_moe_stream_layer *) userdata, a, dst, b);
+}
+
+void llama_moe_stream_remap2_decode(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata) {
+    llama_moe_stream_remap2(dst, a, b, ith, nth, userdata);
 }
 
 // stable per-wave userdata; grows lazily and records the per-wave expert capacity (set at build)

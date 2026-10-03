@@ -112,6 +112,18 @@ struct llama_moe_stream_layer {
 
     std::vector<std::unique_ptr<llama_moe_stream_wave>> wave_ud; // stable per-wave op userdata
 
+    // lookahead prefetch: this layer's router (set after load), and the experts an earlier layer's
+    // remap predicted for it, one record per lookahead distance (guarded by mgr->mtx)
+    ggml_tensor * gate_inp    = nullptr;
+    ggml_tensor * exp_probs_b = nullptr;
+    struct pred_record {
+        std::vector<int32_t> ids;     // predicted ids, rank-major per token
+        std::vector<int32_t> fetched; // experts a prefetch was issued for
+        int32_t n_per_token = 0;
+        bool    valid       = false;
+    };
+    std::vector<pred_record> pred; // [lookahead] index d-1
+
     // stable userdata for wave w (grows lazily); called at graph build time only
     llama_moe_stream_wave * wave_userdata(int32_t wave, uint32_t capacity);
 
@@ -196,6 +208,16 @@ struct llama_moe_stream {
     std::condition_variable cv_done; // a load committed or failed
 
     std::deque<llama_moe_stream_work> q_demand;
+    std::deque<llama_moe_stream_work> q_prefetch; // lookahead loads, served when q_demand is empty
+
+    // lookahead prefetch (LLAMA_MOE_STREAM_LOOKAHEAD=D, default 1, 0 disables): layer L's remap also
+    // receives the routing that layers L+1..L+D's routers produce on L's input (a prediction of their
+    // real routing); the predicted experts that are not resident are prefetched while L's GEMMs and
+    // L+1's attention run. measured on GLM-5.3-Flash: 68% of the distance-1 predictions are confirmed
+    // (98% at rank 1, 35% at rank 8), decode +6%; distance 2 and rank caps measured no better
+    int32_t lookahead      = 1;
+    int32_t lookahead_k[4] = {};   // predicted ranks to prefetch per token, per distance (0 = all n_expert_used)
+    bool    lookahead_stat = false; // LLAMA_MOE_STREAM_LOOKAHEAD_STAT=1: measure accuracy, no prefetch
 
     std::vector<std::thread> workers;
     bool workers_started = false;
@@ -219,6 +241,16 @@ struct llama_moe_stream {
         int64_t n_preload_issued = 0; // next-wave loads started during a wave's compute
         int64_t n_preload_ready  = 0; // wave experts already resident from the previous preload
         int64_t t_stall_wave_us  = 0; // wait time in wave miss handling
+
+        // lookahead prefetch, per distance d (index d-1, up to 4)
+        int64_t pred_n[4]           = {}; // predictions scored
+        int64_t pred_hit[4]         = {}; // predictions the real routing confirmed
+        int64_t pred_rank_n[4][16]  = {}; // per predicted rank
+        int64_t pred_rank_hit[4][16]= {};
+        int64_t pred_miss[4]        = {}; // real demand misses in layers that had a prediction
+        int64_t pred_miss_covered[4]= {}; // ... that the prediction contained
+        int64_t pred_fetch[4]       = {}; // prefetch loads issued
+        int64_t pred_fetch_used[4]  = {}; // ... whose expert the real routing then needed
     } stats;
 
     // internals
@@ -238,6 +270,11 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
 // same op under a distinct function pointer, never registered as a GPU host op: measured faster for
 // single-token decode, where the scheduler split beats a GPU-side event wait on Apple Silicon
 void llama_moe_stream_remap_decode(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+
+// the remap with lookahead: b holds the predicted ids [n_expert_used, n_tokens, D] of layers il+1..il+D;
+// predicted misses are prefetched (or just scored under _STAT)
+void llama_moe_stream_remap2(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata);
+void llama_moe_stream_remap2_decode(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata);
 
 // callbacks of the multi-pass prefill custom ops inserted by build_moe_ffn when a ubatch touches
 // more experts than the cache holds; each src[0] is the contiguous selected ids

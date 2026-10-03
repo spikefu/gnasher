@@ -70,6 +70,20 @@ On unified-memory Macs the runtime also fills cache slots by reading directly in
 Metal shared buffer rather than through a staging copy (`LLAMA_MOE_STREAM_NO_DIRECT_WRITE=1`
 disables it).
 
+### Lookahead prefetch
+
+A miss can only be loaded once the layer's router has run, so without help the SSD and the
+GPU take turns. The runtime therefore also runs the *next* layer's router on the current
+layer's input inside the graph; the residual stream changes little between adjacent layers,
+so this predicts the next layer's real routing well (GLM-5.3-Flash: 68% of predictions are
+confirmed, 98% at rank 1 down to 35% at rank 8) and the predicted misses start loading while
+the current layer's GEMMs and the next layer's attention run. The prediction only drives the
+loader; every layer's real routing is still computed and used, so output is identical.
+Measured on GLM-5.3-Flash, 200 slots: 14.0 -> 14.8 tok/s, hit rate 86.3% -> 89.6%. On by
+default; `LLAMA_MOE_STREAM_LOOKAHEAD=0` disables it, `=2` predicts two layers ahead (measured
+no better), `LLAMA_MOE_STREAM_LOOKAHEAD_K=N` caps the prefetched ranks per token (measured no
+better), `LLAMA_MOE_STREAM_LOOKAHEAD_STAT=1` only scores the predictions.
+
 Experimental switches measured on an M5 Max (see `docs/gnasher/GLM53_FLASH_FEASIBILITY.md`):
 `GGML_METAL_KEEP_WARM=pulse` keeps the GPU clocked through the per-layer CPU gaps of expert
 streaming (+9% decode, idle between requests; `=1` runs continuously); `LLAMA_MOE_STREAM_METAL_HOST_OP=1` runs the prefill remap inside the Metal command
