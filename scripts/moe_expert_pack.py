@@ -33,8 +33,7 @@ def main():
         if 'general.architecture' in r.fields:  # split shards after the first carry no model metadata
             arch = r.fields['general.architecture'].contents()
             bc = r.fields[f'{arch}.block_count'].contents()
-            nextn = r.fields.get(f'{arch}.nextn_predict_layers')
-            n_layer_total = max(n_layer_total, bc + (nextn.contents() if nextn else 0))
+            n_layer_total = max(n_layer_total, bc)  # block_count already includes NextN/MTP layers
         for t in r.tensors:
             m = EXPS.match(t.name)
             if not m:

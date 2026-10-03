@@ -452,7 +452,7 @@ void llama_moe_stream::open_pack(const std::string & path) {
         fail("bad header");
         return;
     }
-    if (hdr.n_layer != layers.size()) {
+    if (hdr.n_layer < layers.size()) {
         fail("layer count mismatch");
         return;
     }
@@ -473,6 +473,9 @@ void llama_moe_stream::open_pack(const std::string & path) {
         }
         pos += pw.size()*sizeof(pw[0]);
 
+        if (il >= layers.size()) {
+            continue; // the pack may describe layers this model does not stream (e.g. a NextN block)
+        }
         auto & sl = layers[il];
         if (!sl || le.n_weights == 0) {
             continue;
